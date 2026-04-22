@@ -1,0 +1,13 @@
+{
+  "name": "IntelliCane",
+  "short_name": "IntelliCane",
+  "description": "Assistive vision and obstacle detection for the IntelliCane smart cane",
+  "start_url": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0d12",
+  "theme_color": "#0b0d12",
+  "icons": [
+    { "src": "./favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
