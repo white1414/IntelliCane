@@ -64,7 +64,7 @@ export default function DiagnosticsPage() {
             </Badge>
           </li>
           <li className="flex justify-between items-center">
-            <span>YOLO ONNX Model</span>
+            <span>YOLO TFLite Model</span>
             <Badge variant={isModelLoaded() ? "default" : "secondary"}>
               {isModelLoaded() ? "Loaded" : "Not loaded yet"}
             </Badge>
