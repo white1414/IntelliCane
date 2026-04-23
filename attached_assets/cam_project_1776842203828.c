@@ -1,25 +1,35 @@
-// main.c — IntelliCane ESP32-CAM (ESP-IDF)
+// main.c — IntelliCane ESP32-CAM (ESP-IDF)  v2
 //
-// Adds three things on top of your existing firmware:
-//   1. UART2 reader on GPIO 14 — receives the JSON sensor lines streamed
-//      by the Arduino Nano. Latest line is cached and exposed at /sensors.
-//   2. /sensors HTTP endpoint — returns the most recent Nano JSON line, or
-//      `{"status":"idle"}` if nothing has arrived yet.
-//   3. SOS button now requires a 2-SECOND HOLD before it fires. A quick tap
-//      is ignored. The phone polls /sos every second; first poll after a
-//      hold returns the press, then it auto-clears.
+// Adds on top of v1:
+//   - Multi-click detection on the SOS button (GPIO 15):
+//        * Hold >= 2 s            -> "sos"   (panic, full SMS+call)
+//        * 2 quick clicks         -> "call1" (speed-dial Person 1)
+//        * 3 quick clicks         -> "call2" (speed-dial Person 2)
+//        * Single click           -> "ack"   (used to cancel a fall alert)
+//     A click is a press shorter than 600 ms; consecutive clicks must arrive
+//     within 500 ms of each other to be merged. Once we report a "sos" hold
+//     we ignore any further presses until the user releases.
+//   - UART2 is now bi-directional: GPIO 13 = TX out to Nano D0 (RX). The
+//     phone hits POST /vibrate?on=1 (or 0) and we send 'V' or 'S' down the
+//     wire. This lets the phone tell the cane's vibrator to buzz non-stop
+//     during a suspected-fall countdown.
 //
 // Pin map summary (AI-Thinker ESP32-CAM):
-//   GPIO 14  — UART2 RX  (wire to Nano TX through a 1k/2k divider 5V→3.3V)
-//   GPIO 15  — SOS push button to GND (active low, internal pull-up enabled)
-//   GPIO 1   — UART0 TX  (still used for ESP-IDF log output / programming)
-//   GPIO 3   — UART0 RX  (used for programming; you can leave it floating)
+//   GPIO 14  — UART2 RX  (Nano TX through 1k/2k divider 5V → 3.3V)
+//   GPIO 13  — UART2 TX  (to Nano D0/RX, direct — 3.3V is a valid HIGH for Nano)
+//   GPIO 15  — SOS push button to GND (active low, internal pull-up)
+//   GPIO 1   — UART0 TX  (ESP-IDF log / programming)
+//   GPIO 3   — UART0 RX  (programming)
 //
-// All other endpoints kept as-is:
-//   GET /            — MJPEG stream (multipart/x-mixed-replace)
-//   GET /frame.jpg   — single JPEG snapshot
-//   GET /sos         — JSON, returns SOS event if pending then clears
-//   GET /sensors     — JSON, latest Nano sensor reading
+// Endpoints:
+//   GET  /            — MJPEG stream (multipart/x-mixed-replace)
+//   GET  /frame.jpg   — single JPEG snapshot
+//   GET  /sos         — JSON, returns latest button event then clears.
+//                       Shape: {"type":"sos|call1|call2|ack","time":1234}
+//                       or     {"type":"idle"}
+//   GET  /sensors     — JSON, latest Nano sensor reading
+//   POST /vibrate?on=1  — start continuous vibrate on the Nano motor
+//   POST /vibrate?on=0  — stop continuous vibrate
 
 #include <string.h>
 #include <stdio.h>
@@ -62,7 +72,7 @@ static const char *TAG = "intellicane";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-/* ---------------- I2C config (kept) ---------------- */
+/* ---------------- I2C config ---------------- */
 #define I2C_MASTER_NUM            I2C_NUM_0
 #define I2C_MASTER_SDA_IO         SIOD_GPIO_NUM
 #define I2C_MASTER_SCL_IO         SIOC_GPIO_NUM
@@ -74,12 +84,14 @@ static const char *TAG = "intellicane";
 
 /* ---------------- SOS button ---------------- */
 #define SOS_BUTTON_GPIO        15
-#define SOS_HOLD_REQUIRED_MS   2000   // must be held this long to fire
+#define SOS_HOLD_REQUIRED_MS   2000   // long-hold = panic
+#define CLICK_MAX_PRESS_MS      600   // press shorter than this counts as a click
+#define CLICK_GROUP_GAP_MS      500   // gap between clicks to be considered same group
 
-/* ---------------- Nano UART link ---------------- */
+/* ---------------- Nano UART link (bidirectional) ---------------- */
 #define NANO_UART_NUM   UART_NUM_2
 #define NANO_UART_RX    14
-#define NANO_UART_TX    UART_PIN_NO_CHANGE   // we never talk back to the Nano
+#define NANO_UART_TX    13
 #define NANO_UART_BAUD  9600
 #define NANO_UART_BUF   1024
 
@@ -90,8 +102,18 @@ static const char *TAG = "intellicane";
 #define CAMERA_FB_COUNT     2
 
 /* ---------------- Globals ---------------- */
-static volatile int64_t last_sos_time_ms = 0;
-static portMUX_TYPE     s_sos_mux        = portMUX_INITIALIZER_UNLOCKED;
+// Latest pending button event, consumed by /sos handler.
+typedef enum {
+    EV_NONE = 0,
+    EV_SOS,
+    EV_CALL1,
+    EV_CALL2,
+    EV_ACK,
+} btn_event_t;
+
+static volatile btn_event_t s_pending_event = EV_NONE;
+static volatile int64_t     s_pending_time_ms = 0;
+static portMUX_TYPE         s_event_mux = portMUX_INITIALIZER_UNLOCKED;
 
 #define SENSOR_LINE_MAX 256
 static char        g_sensors_json[SENSOR_LINE_MAX] = "";
@@ -106,11 +128,13 @@ static esp_err_t      stream_handler(httpd_req_t *req);
 static esp_err_t      frame_handler(httpd_req_t *req);
 static esp_err_t      sos_handler(httpd_req_t *req);
 static esp_err_t      sensors_handler(httpd_req_t *req);
+static esp_err_t      vibrate_handler(httpd_req_t *req);
 static httpd_handle_t start_webserver(void);
 static void           sos_button_init(void);
 static void           sos_button_task(void *arg);
 static void           nano_uart_init(void);
 static void           nano_uart_task(void *arg);
+static void           push_event(btn_event_t ev);
 
 /* ---------------- I2C init ---------------- */
 void i2c_init() {
@@ -214,23 +238,38 @@ static esp_err_t frame_handler(httpd_req_t *req) {
     return res;
 }
 
-/* ---------------- /sos endpoint ---------------- */
+/* ---------------- /sos endpoint (multi-event) ---------------- */
 static esp_err_t sos_handler(httpd_req_t *req) {
-    char resp[128];
-    int64_t t = 0;
-    portENTER_CRITICAL(&s_sos_mux);
-    t = last_sos_time_ms;
-    last_sos_time_ms = 0;
-    portEXIT_CRITICAL(&s_sos_mux);
+    char resp[160];
+    btn_event_t ev;
+    int64_t t;
+
+    portENTER_CRITICAL(&s_event_mux);
+    ev = s_pending_event;
+    t  = s_pending_time_ms;
+    s_pending_event   = EV_NONE;
+    s_pending_time_ms = 0;
+    portEXIT_CRITICAL(&s_event_mux);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    const char *type_str = "idle";
+    switch (ev) {
+        case EV_SOS:   type_str = "sos";   break;
+        case EV_CALL1: type_str = "call1"; break;
+        case EV_CALL2: type_str = "call2"; break;
+        case EV_ACK:   type_str = "ack";   break;
+        default: break;
+    }
+
     int len;
-    if (t != 0) {
-        len = snprintf(resp, sizeof(resp),
-            "{\"type\":\"sos\",\"source\":\"button\",\"time\":%lld}", (long long)t);
+    if (ev == EV_NONE) {
+        len = snprintf(resp, sizeof(resp), "{\"type\":\"idle\"}");
     } else {
-        len = snprintf(resp, sizeof(resp), "{\"type\":\"sos\",\"status\":\"idle\"}");
+        len = snprintf(resp, sizeof(resp),
+            "{\"type\":\"%s\",\"source\":\"button\",\"time\":%lld}",
+            type_str, (long long)t);
     }
     return httpd_resp_send(req, resp, len);
 }
@@ -256,37 +295,90 @@ static esp_err_t sensors_handler(httpd_req_t *req) {
         const char *msg = "{\"status\":\"idle\"}";
         return httpd_resp_send(req, msg, strlen(msg));
     }
-    // Append our own age_ms field so the phone can tell if data is stale.
     char wrapped[SENSOR_LINE_MAX + 64];
     int len = snprintf(wrapped, sizeof(wrapped),
         "{\"data\":%s,\"age_ms\":%lld}", snapshot, (long long)age_ms);
     return httpd_resp_send(req, wrapped, len);
 }
 
+/* ---------------- /vibrate endpoint (POST) ---------------- */
+//
+// Accepts ?on=1 / ?on=0 in the query string. We could also accept a JSON
+// body but query-string keeps the phone code trivial.
+static esp_err_t vibrate_handler(httpd_req_t *req) {
+    char query[32];
+    char val[8] = {0};
+    bool on = false;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "on", val, sizeof(val)) == ESP_OK) {
+            on = (val[0] == '1' || val[0] == 't' || val[0] == 'T');
+        }
+    }
+
+    char cmd = on ? 'V' : 'S';
+    uart_write_bytes(NANO_UART_NUM, &cmd, 1);
+    // newline so the Nano's loop sees it promptly even if it ever buffered
+    uart_write_bytes(NANO_UART_NUM, "\n", 1);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    char resp[48];
+    int len = snprintf(resp, sizeof(resp), "{\"vibrate\":%s}", on ? "true" : "false");
+    return httpd_resp_send(req, resp, len);
+}
+
+// CORS preflight for /vibrate (browsers will send OPTIONS first for POST
+// from a different origin). Any URI matches; we only register OPTIONS.
+static esp_err_t options_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 /* ---------------- HTTP server ---------------- */
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size  = 8192;
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 12;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start httpd");
         return NULL;
     }
 
-    httpd_uri_t stream_uri  = { .uri="/",          .method=HTTP_GET, .handler=stream_handler };
-    httpd_uri_t frame_uri   = { .uri="/frame.jpg", .method=HTTP_GET, .handler=frame_handler };
-    httpd_uri_t sos_uri     = { .uri="/sos",       .method=HTTP_GET, .handler=sos_handler };
-    httpd_uri_t sensors_uri = { .uri="/sensors",   .method=HTTP_GET, .handler=sensors_handler };
+    httpd_uri_t stream_uri   = { .uri="/",          .method=HTTP_GET,    .handler=stream_handler };
+    httpd_uri_t frame_uri    = { .uri="/frame.jpg", .method=HTTP_GET,    .handler=frame_handler };
+    httpd_uri_t sos_uri      = { .uri="/sos",       .method=HTTP_GET,    .handler=sos_handler };
+    httpd_uri_t sensors_uri  = { .uri="/sensors",   .method=HTTP_GET,    .handler=sensors_handler };
+    httpd_uri_t vibrate_uri  = { .uri="/vibrate",   .method=HTTP_POST,   .handler=vibrate_handler };
+    httpd_uri_t vibrate_opts = { .uri="/vibrate",   .method=HTTP_OPTIONS,.handler=options_handler };
     httpd_register_uri_handler(server, &stream_uri);
     httpd_register_uri_handler(server, &frame_uri);
     httpd_register_uri_handler(server, &sos_uri);
     httpd_register_uri_handler(server, &sensors_uri);
+    httpd_register_uri_handler(server, &vibrate_uri);
+    httpd_register_uri_handler(server, &vibrate_opts);
     ESP_LOGI(TAG, "HTTP server up");
     return server;
 }
 
-/* ---------------- SOS button (2-second hold detector) ---------------- */
+/* ---------------- SOS button: hold + multi-click detector ---------------- */
+//
+// State machine, polled at 50 ms:
+//   - On falling edge: remember press start.
+//   - While held past 2 s: emit EV_SOS once and lock until release.
+//   - On rising edge: if press was short (< CLICK_MAX_PRESS_MS) increment a
+//     click counter, store the time of the release.
+//   - When CLICK_GROUP_GAP_MS elapses with no new press, emit:
+//        1 click   -> EV_ACK
+//        2 clicks  -> EV_CALL1
+//        3+ clicks -> EV_CALL2
+//
+// Note: a long-hold (already emitted as SOS) does NOT count as a click on
+// release — we set a flag to suppress that.
 static void sos_button_init(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << SOS_BUTTON_GPIO),
@@ -298,41 +390,74 @@ static void sos_button_init(void) {
     gpio_config(&io_conf);
 }
 
+static void push_event(btn_event_t ev) {
+    int64_t now_ms = esp_timer_get_time() / 1000LL;
+    portENTER_CRITICAL(&s_event_mux);
+    s_pending_event   = ev;
+    s_pending_time_ms = now_ms;
+    portEXIT_CRITICAL(&s_event_mux);
+}
+
 static void sos_button_task(void *arg) {
     bool was_high = true;
     int64_t pressed_at_ms = 0;
-    bool reported_for_this_press = false;
+    int64_t last_release_ms = 0;
+    bool sos_fired_for_this_press = false;
+    int  click_count = 0;
 
     for (;;) {
         int level = gpio_get_level(SOS_BUTTON_GPIO);
         int64_t now_ms = esp_timer_get_time() / 1000LL;
 
         if (level == 0 && was_high) {
-            // Just went down — start the hold timer.
+            // Just went down.
             pressed_at_ms = now_ms;
-            reported_for_this_press = false;
+            sos_fired_for_this_press = false;
             was_high = false;
         } else if (level == 0 && !was_high) {
-            // Still being held.
-            if (!reported_for_this_press &&
+            // Still being held — check long-hold panic.
+            if (!sos_fired_for_this_press &&
                 (now_ms - pressed_at_ms) >= SOS_HOLD_REQUIRED_MS) {
                 ESP_LOGW(TAG, "SOS HOLD confirmed (%lld ms)",
                          (long long)(now_ms - pressed_at_ms));
-                portENTER_CRITICAL(&s_sos_mux);
-                last_sos_time_ms = now_ms;
-                portEXIT_CRITICAL(&s_sos_mux);
-                reported_for_this_press = true;
+                push_event(EV_SOS);
+                sos_fired_for_this_press = true;
+                click_count = 0;  // cancel any in-flight click sequence
             }
         } else if (level == 1 && !was_high) {
-            // Released. Reset.
+            // Released.
+            int64_t held = now_ms - pressed_at_ms;
             was_high = true;
+
+            if (!sos_fired_for_this_press && held < CLICK_MAX_PRESS_MS) {
+                click_count++;
+                last_release_ms = now_ms;
+            }
+            // long-hold release is consumed by the SOS event already
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        // Click-grouping timeout: if we have pending clicks and the gap has
+        // passed without a new press, dispatch.
+        if (click_count > 0 && was_high &&
+            (now_ms - last_release_ms) >= CLICK_GROUP_GAP_MS) {
+            if (click_count == 1) {
+                ESP_LOGI(TAG, "single click -> ACK");
+                push_event(EV_ACK);
+            } else if (click_count == 2) {
+                ESP_LOGI(TAG, "double click -> CALL1");
+                push_event(EV_CALL1);
+            } else {
+                ESP_LOGI(TAG, "triple+ click -> CALL2");
+                push_event(EV_CALL2);
+            }
+            click_count = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-/* ---------------- Nano UART listener ---------------- */
+/* ---------------- Nano UART listener (and writer) ---------------- */
 static void nano_uart_init(void) {
     uart_config_t uart_config = {
         .baud_rate = NANO_UART_BAUD,
@@ -344,7 +469,7 @@ static void nano_uart_init(void) {
     uart_param_config(NANO_UART_NUM, &uart_config);
     uart_set_pin(NANO_UART_NUM, NANO_UART_TX, NANO_UART_RX,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(NANO_UART_NUM, NANO_UART_BUF * 2, 0, 0, NULL, 0);
+    uart_driver_install(NANO_UART_NUM, NANO_UART_BUF * 2, NANO_UART_BUF, 0, NULL, 0);
 }
 
 static void nano_uart_task(void *arg) {
@@ -373,7 +498,6 @@ static void nano_uart_task(void *arg) {
             } else if (line_len < (int)sizeof(line) - 1) {
                 line[line_len++] = c;
             } else {
-                // line too long — discard
                 line_len = 0;
             }
         }
@@ -412,5 +536,6 @@ void app_main(void) {
         "  Stream:   http://192.168.4.1/\n"
         "  Snapshot: http://192.168.4.1/frame.jpg\n"
         "  Sensors:  http://192.168.4.1/sensors\n"
-        "  SOS poll: http://192.168.4.1/sos");
+        "  SOS poll: http://192.168.4.1/sos\n"
+        "  Vibrate:  POST http://192.168.4.1/vibrate?on=1");
 }

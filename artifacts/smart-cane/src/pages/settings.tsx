@@ -5,6 +5,9 @@ import {
   getConfThreshold, setConfThreshold,
   getTargetFps, setTargetFps,
   getGuardianPhone, setGuardianPhone,
+  getPerson1Phone, setPerson1Phone,
+  getPerson2Phone, setPerson2Phone,
+  getFallDetectEnabled, setFallDetectEnabled,
   getUserName, setUserName,
 } from "@/lib/settings";
 import { Button } from "@/components/ui/button";
@@ -18,13 +21,16 @@ import { Activity, Info, Download, ShieldAlert } from "lucide-react";
 import { smsCapability } from "@/lib/sms";
 
 export default function SettingsPage() {
-  const { reconnect, audioMuted, setAudioMuted, triggerSos } = useSmartCane();
+  const { reconnect, audioMuted, setAudioMuted, triggerSos, simulateFall } = useSmartCane();
   const { toast } = useToast();
 
   const [hostVal, setHostVal] = useState("");
   const [confVal, setConfVal] = useState([0.45]);
   const [fpsVal, setFpsVal] = useState([2]);
   const [guardian, setGuardian] = useState("");
+  const [person1, setPerson1] = useState("");
+  const [person2, setPerson2] = useState("");
+  const [fallEnabled, setFallEnabled] = useState(true);
   const [userName, setUserNameLocal] = useState("");
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   const [smsMode, setSmsMode] = useState<"native-silent" | "composer" | "none">("none");
@@ -34,6 +40,9 @@ export default function SettingsPage() {
     setConfVal([getConfThreshold()]);
     setFpsVal([getTargetFps()]);
     setGuardian(getGuardianPhone());
+    setPerson1(getPerson1Phone());
+    setPerson2(getPerson2Phone());
+    setFallEnabled(getFallDetectEnabled());
     setUserNameLocal(getUserName());
     setSmsMode(smsCapability());
 
@@ -53,8 +62,19 @@ export default function SettingsPage() {
 
   const handleSaveSos = () => {
     setGuardianPhone(guardian);
+    setPerson1Phone(person1);
+    setPerson2Phone(person2);
+    setFallDetectEnabled(fallEnabled);
     setUserName(userName);
-    toast({ title: "Saved", description: "Guardian contact updated." });
+    toast({ title: "Saved", description: "Emergency contacts updated." });
+  };
+
+  const handleTestFall = () => {
+    simulateFall();
+    toast({
+      title: "Fall test started",
+      description: "Tap I'M OK or single-click the cane button to cancel.",
+    });
   };
 
   const handleTestSos = async () => {
@@ -165,6 +185,55 @@ export default function SettingsPage() {
         </div>
 
         <div className="space-y-3">
+          <Label htmlFor="person1" className="text-base font-semibold">Person 1 — Speed Dial (double-click)</Label>
+          <Input
+            id="person1"
+            type="tel"
+            inputMode="tel"
+            placeholder="+15551234567"
+            value={person1}
+            onChange={(e) => setPerson1(e.target.value)}
+            className="text-lg bg-background"
+            data-testid="input-person1"
+          />
+          <p className="text-xs text-muted-foreground">
+            Two quick clicks on the cane button place a call to this number.
+          </p>
+        </div>
+
+        <div className="space-y-3">
+          <Label htmlFor="person2" className="text-base font-semibold">Person 2 — Speed Dial (triple-click)</Label>
+          <Input
+            id="person2"
+            type="tel"
+            inputMode="tel"
+            placeholder="+15551234567"
+            value={person2}
+            onChange={(e) => setPerson2(e.target.value)}
+            className="text-lg bg-background"
+            data-testid="input-person2"
+          />
+          <p className="text-xs text-muted-foreground">
+            Three quick clicks call this person.
+          </p>
+        </div>
+
+        <div className="flex items-center justify-between py-1">
+          <div className="space-y-1 pr-3">
+            <Label htmlFor="falltoggle" className="text-base font-semibold">Fall detection</Label>
+            <p className="text-xs text-muted-foreground">
+              Uses the phone's accelerometer. On a suspected fall the cane vibrates and you have 25 s to single-click the cane button (or tap I'M OK) before SOS fires.
+            </p>
+          </div>
+          <Switch
+            id="falltoggle"
+            checked={fallEnabled}
+            onCheckedChange={setFallEnabled}
+            data-testid="switch-fall-detect"
+          />
+        </div>
+
+        <div className="space-y-3">
           <Label htmlFor="username" className="text-base font-semibold">Your Name (optional)</Label>
           <Input
             id="username"
@@ -177,9 +246,10 @@ export default function SettingsPage() {
           <p className="text-xs text-muted-foreground">If set, the SOS message reads "Sam is in danger" instead of "Person in danger".</p>
         </div>
 
-        <div className="flex gap-2">
-          <Button onClick={handleSaveSos} variant="secondary" className="flex-1" data-testid="button-save-sos">Save</Button>
-          <Button onClick={handleTestSos} variant="outline" className="flex-1" data-testid="button-test-sos">Test SOS</Button>
+        <div className="flex flex-wrap gap-2">
+          <Button onClick={handleSaveSos} variant="secondary" className="flex-1 min-w-[7rem]" data-testid="button-save-sos">Save</Button>
+          <Button onClick={handleTestSos} variant="outline" className="flex-1 min-w-[7rem]" data-testid="button-test-sos">Test SOS</Button>
+          <Button onClick={handleTestFall} variant="outline" className="flex-1 min-w-[7rem]" data-testid="button-test-fall">Test fall alert</Button>
         </div>
 
         <div className="bg-secondary/50 p-4 rounded-xl text-xs text-secondary-foreground space-y-2">

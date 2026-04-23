@@ -25,7 +25,10 @@ export interface SensorReading {
   age_ms?: number;
 }
 
+export type ButtonEventType = "sos" | "call1" | "call2" | "ack";
+
 export interface SosEvent {
+  type: ButtonEventType;
   time: number;   // ms since ESP32 boot
   receivedAt: number;
 }
@@ -70,6 +73,24 @@ export class ESP32Client {
 
   get hostname(): string {
     return this.host;
+  }
+
+  // POST /vibrate?on=1|0 — tells the Nano (via ESP32 UART) to drive the
+  // vibration motor non-stop, used during a suspected-fall countdown.
+  async setVibrate(on: boolean): Promise<boolean> {
+    try {
+      const ctrl = new AbortController();
+      const tid = window.setTimeout(() => ctrl.abort(), 1500);
+      const resp = await fetch(`http://${this.host}/vibrate?on=${on ? 1 : 0}`, {
+        method: "POST",
+        cache: "no-store",
+        signal: ctrl.signal,
+      });
+      window.clearTimeout(tid);
+      return resp.ok;
+    } catch {
+      return false;
+    }
   }
 
   connect() {
@@ -172,9 +193,16 @@ export class ESP32Client {
       window.clearTimeout(tid);
       if (resp.ok) {
         const body = await resp.json();
-        if (body && body.type === "sos" && typeof body.time === "number" && body.time > 0) {
-          const evt: SosEvent = { time: body.time, receivedAt: Date.now() };
-          for (const fn of this.sosListeners) fn(evt);
+        if (body && typeof body.type === "string" && body.type !== "idle") {
+          const t = body.type as ButtonEventType;
+          if (t === "sos" || t === "call1" || t === "call2" || t === "ack") {
+            const evt: SosEvent = {
+              type: t,
+              time: typeof body.time === "number" ? body.time : Date.now(),
+              receivedAt: Date.now(),
+            };
+            for (const fn of this.sosListeners) fn(evt);
+          }
         }
       }
     } catch {

@@ -1,5 +1,5 @@
 /*
- * IntelliCane — Arduino Nano firmware
+ * IntelliCane — Arduino Nano firmware (v2: with bi-directional serial)
  *
  * What it does:
  *   - Reads 4 x VL53L0X Time-of-Flight sensors over I2C (different XSHUT pins
@@ -8,11 +8,15 @@
  *     ground drops like steps and curbs).
  *   - Drives a piezo buzzer + a vibration motor whenever ANY of those is
  *     under the user-set distance threshold.
- *   - ALSO sends one JSON line every ~50 ms over Serial (TX/RX) so the
- *     ESP32-CAM can forward the same readings to the phone — that's how the
- *     PWA speaks the obstacle direction + distance.
+ *   - Sends one JSON line every ~50 ms over Serial (TX/RX) so the ESP32-CAM
+ *     can forward the same readings to the phone.
+ *   - LISTENS on Serial for single-byte commands from the ESP32-CAM:
+ *         'V'  -> turn the vibrator ON continuously (fall-alert mode).
+ *         'S'  -> stop continuous vibrate, return to normal proximity mode.
+ *     While in continuous-vibrate mode the local proximity buzzer/vibrator
+ *     logic is suppressed so the user gets a clear, distinct alert.
  *
- * Wiring (matches your existing layout):
+ * Wiring (matches your existing layout, plus 1 new wire):
  *   D2 -> XSHUT of ToF #1 (front)
  *   D3 -> XSHUT of ToF #2 (front-left)
  *   D4 -> XSHUT of ToF #3 (front-right)
@@ -24,13 +28,16 @@
  *   D8 -> piezo buzzer
  *   D9 -> vibration motor
  *
- *   TX (D1) -> ESP32-CAM GPIO 14 (the UART2 RX we configured in main.c)
- *              via a 1k/2k divider 5V -> 3.3V (DON'T connect 5V TX directly
- *              to a 3.3V input or you'll cook the ESP32 over time).
+ *   D1 (TX) -> ESP32-CAM GPIO 14 (UART2 RX) via 1k/2k divider 5V -> 3.3V.
+ *   D0 (RX) <- ESP32-CAM GPIO 13 (UART2 TX) DIRECT (3.3V -> 5V Nano is OK).
  *   GND <-> ESP32-CAM GND
  *
+ *   ⚠ While the ESP32-CAM TX line is connected to D0, you cannot upload to
+ *   the Nano over USB (the two TX sources fight on RX). Disconnect the wire
+ *   from D0 while flashing, then plug it back.
+ *
  * Library required:
- *   "VL53L0X" by Pololu (the same library your existing sketch uses)
+ *   "VL53L0X" by Pololu
  */
 
 #include <Wire.h>
@@ -46,19 +53,19 @@ const int xshutPins[] = {2, 3, 4, 5};
 #define BUZZER_PIN 8
 #define VIB_PIN    9
 
-// Sensor index -> human name (used inside the JSON we send to the ESP32)
-//   0 = front center
-//   1 = front-left
-//   2 = front-right
-//   3 = side
 VL53L0X tofs[4];
 
 // --- send-rate limiter ---
 unsigned long lastSendMs = 0;
 const unsigned long SEND_INTERVAL_MS = 50;
 
+// --- Continuous-vibrate (fall-alert) mode ---
+// When true, VIB_PIN is held HIGH non-stop and proximity alerts are
+// suppressed (so the user doesn't get confused which alert is which).
+bool forceVibrate = false;
+
 void setup() {
-  // 9600 baud matches what the ESP32-CAM UART2 is configured to read.
+  // 9600 baud matches what the ESP32-CAM UART2 is configured for.
   Serial.begin(9600);
   Wire.begin();
 
@@ -79,7 +86,6 @@ void setup() {
     digitalWrite(xshutPins[i], HIGH);
     delay(10);
     if (!tofs[i].init()) {
-      // If a sensor fails we keep going — it'll just send -1 forever.
       Serial.print(F("{\"err\":\"tof_init_fail\",\"i\":"));
       Serial.print(i);
       Serial.println("}");
@@ -110,7 +116,24 @@ int readToFCm(int i) {
   return (int)(mm / 10);
 }
 
+// Drain any waiting bytes from the ESP32-CAM and update forceVibrate.
+// We only ever expect single-byte commands so this is dead simple.
+void pollSerialCommands() {
+  while (Serial.available() > 0) {
+    int b = Serial.read();
+    if (b == 'V' || b == 'v') {
+      forceVibrate = true;
+    } else if (b == 'S' || b == 's') {
+      forceVibrate = false;
+    }
+    // Anything else (newline, junk) — ignore.
+  }
+}
+
 void loop() {
+  // 0) Check for incoming control bytes from the ESP32.
+  pollSerialCommands();
+
   // 1) Read everything
   int front  = readToFCm(0);
   int fl     = readToFCm(1);
@@ -118,24 +141,33 @@ void loop() {
   int side   = readToFCm(3);
   int ground = readUltrasonicCm();
 
-  // 2) Decide local alert (buzzer + vibrator)
+  // 2) Decide local alert state.
+  //    - Fall-alert (forceVibrate) ALWAYS wins: vibrator on, buzzer off so
+  //      the pattern is unambiguous.
+  //    - Otherwise normal proximity logic applies.
   bool alert = false;
-  int candidates[5] = { front, fl, fr, side, ground };
-  for (int i = 0; i < 5; i++) {
-    if (candidates[i] > 0 && candidates[i] <= thresholdCm) {
-      alert = true;
-      break;
+  if (forceVibrate) {
+    digitalWrite(VIB_PIN, HIGH);
+    noTone(BUZZER_PIN);
+    alert = true;  // reflected in JSON for visibility
+  } else {
+    int candidates[5] = { front, fl, fr, side, ground };
+    for (int i = 0; i < 5; i++) {
+      if (candidates[i] > 0 && candidates[i] <= thresholdCm) {
+        alert = true;
+        break;
+      }
+    }
+    if (alert) {
+      digitalWrite(VIB_PIN, HIGH);
+      tone(BUZZER_PIN, 1000);
+    } else {
+      digitalWrite(VIB_PIN, LOW);
+      noTone(BUZZER_PIN);
     }
   }
-  if (alert) {
-    digitalWrite(VIB_PIN, HIGH);
-    tone(BUZZER_PIN, 1000);
-  } else {
-    digitalWrite(VIB_PIN, LOW);
-    noTone(BUZZER_PIN);
-  }
 
-  // 3) Forward sensor JSON to ESP32 every SEND_INTERVAL_MS
+  // 3) Forward sensor JSON to ESP32 every SEND_INTERVAL_MS.
   unsigned long now = millis();
   if (now - lastSendMs >= SEND_INTERVAL_MS) {
     lastSendMs = now;
@@ -145,6 +177,7 @@ void loop() {
     Serial.print(",\"side\":");   Serial.print(side);
     Serial.print(",\"ground\":"); Serial.print(ground);
     Serial.print(",\"alert\":");  Serial.print(alert ? 1 : 0);
+    Serial.print(",\"fall\":");   Serial.print(forceVibrate ? 1 : 0);
     Serial.println("}");
   }
 

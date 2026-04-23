@@ -1,14 +1,25 @@
 import { createContext, useContext, useEffect, useState, useRef, ReactNode, useCallback } from "react";
 import { ESP32Client, SensorReading, ConnState, SosEvent } from "@/lib/esp32";
-import { getHost, getGuardianPhone, getUserName } from "@/lib/settings";
+import {
+  getHost, getGuardianPhone, getUserName,
+  getPerson1Phone, getPerson2Phone, getFallDetectEnabled,
+} from "@/lib/settings";
 import { announceObstacle, speakUrgent } from "@/lib/tts";
 import { getLocationOnce, googleMapsLink } from "@/lib/geo";
 import { sendSms, buildSosMessage, placeCall } from "@/lib/sms";
+import { FallDetector } from "@/lib/fallDetect";
 
 export interface SosOutcome {
   ok: boolean;
   message: string;
   mapsLink?: string;
+}
+
+export interface FallAlertState {
+  active: boolean;
+  startedAt: number;   // performance.now() basis
+  totalMs: number;
+  remainingMs: number;
 }
 
 interface SmartCaneContextValue {
@@ -21,10 +32,16 @@ interface SmartCaneContextValue {
   reconnect: () => void;
   lastSos: SosEvent | null;
   lastSosOutcome: SosOutcome | null;
-  triggerSos: (opts?: { alsoCall?: boolean }) => Promise<SosOutcome>;
+  triggerSos: (opts?: { alsoCall?: boolean; kind?: "sos" | "fall" }) => Promise<SosOutcome>;
+  fallAlert: FallAlertState;
+  cancelFallAlert: () => void;
+  // Manual debug trigger for the fall flow (used by Settings → Test).
+  simulateFall: () => void;
 }
 
 const SmartCaneContext = createContext<SmartCaneContextValue | undefined>(undefined);
+
+const FALL_COUNTDOWN_MS = 25_000;
 
 export function SmartCaneProvider({ children }: { children: ReactNode }) {
   const [client, setClient] = useState<ESP32Client | null>(null);
@@ -34,14 +51,23 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
   const [audioMuted, setAudioMuted] = useState(false);
   const [lastSos, setLastSos] = useState<SosEvent | null>(null);
   const [lastSosOutcome, setLastSosOutcome] = useState<SosOutcome | null>(null);
+  const [fallAlert, setFallAlert] = useState<FallAlertState>({
+    active: false, startedAt: 0, totalMs: FALL_COUNTDOWN_MS, remainingMs: 0,
+  });
 
   const lastObstacleAnnounce = useRef<{ dir: string; time: number } | null>(null);
   const audioMutedRef = useRef(audioMuted);
   audioMutedRef.current = audioMuted;
   const sosInFlight = useRef(false);
+  const clientRef = useRef<ESP32Client | null>(null);
+  const fallTimerRef = useRef<number | null>(null);
+  const fallTickRef  = useRef<number | null>(null);
+  const fallActiveRef = useRef(false);
+  const fallDetectorRef = useRef<FallDetector | null>(null);
 
-  const triggerSos = useCallback(async (opts?: { alsoCall?: boolean }): Promise<SosOutcome> => {
+  const triggerSos = useCallback(async (opts?: { alsoCall?: boolean; kind?: "sos" | "fall" }): Promise<SosOutcome> => {
     const alsoCall = opts?.alsoCall ?? false;
+    const kind = opts?.kind ?? "sos";
     if (sosInFlight.current) {
       return { ok: false, message: "SOS already in progress." };
     }
@@ -58,26 +84,29 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
         return out;
       }
 
-      speakUrgent(alsoCall ? "Sending S O S and calling guardian." : "Sending S O S to guardian.");
+      if (kind === "fall") {
+        speakUrgent("Sending fall alert and calling guardian.");
+      } else {
+        speakUrgent(alsoCall ? "Sending S O S and calling guardian." : "Sending S O S to guardian.");
+      }
 
       let mapsLink = "(location unavailable)";
       try {
         const fix = await getLocationOnce(8000);
         mapsLink = googleMapsLink(fix.lat, fix.lng);
       } catch (err) {
-        // We still send the SMS — the message will just say location unavailable.
         const reason = err instanceof Error ? err.message : "unknown";
         speakUrgent(`Could not get location. Sending without it.`);
         mapsLink = `(location unavailable: ${reason})`;
       }
 
-      const body = buildSosMessage({ userName: getUserName(), mapsLink });
+      const body = buildSosMessage({ userName: getUserName(), mapsLink, kind });
       const result = await sendSms(phone, body);
 
       let smsMsg: string;
       let smsOk: boolean;
       if (result.sent) {
-        smsMsg = "SOS sent to guardian.";
+        smsMsg = kind === "fall" ? "Fall alert sent to guardian." : "SOS sent to guardian.";
         smsOk = true;
       } else if (result.openedComposer) {
         smsMsg = "Opened your SMS app — tap Send to dispatch.";
@@ -122,11 +151,82 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // ------------- Speed dial helpers -------------
+  const speedDial = useCallback(async (which: "person1" | "person2") => {
+    const phone = which === "person1" ? getPerson1Phone() : getPerson2Phone();
+    const label = which === "person1" ? "Person 1" : "Person 2";
+    if (!phone) {
+      speakUrgent(`No number set for ${label}.`);
+      return;
+    }
+    speakUrgent(`Calling ${label}.`);
+    if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(60);
+    await placeCall(phone);
+  }, []);
+
+  // ------------- Fall alert flow -------------
+  const stopVibrate = useCallback(() => {
+    const c = clientRef.current;
+    if (c) { void c.setVibrate(false); }
+  }, []);
+
+  const cancelFallAlert = useCallback(() => {
+    if (!fallActiveRef.current) return;
+    fallActiveRef.current = false;
+    if (fallTimerRef.current !== null) { clearTimeout(fallTimerRef.current); fallTimerRef.current = null; }
+    if (fallTickRef.current  !== null) { clearInterval(fallTickRef.current);  fallTickRef.current  = null; }
+    stopVibrate();
+    fallDetectorRef.current?.setSuppressed(false);
+    setFallAlert({ active: false, startedAt: 0, totalMs: FALL_COUNTDOWN_MS, remainingMs: 0 });
+    speakUrgent("Fall alert cancelled. Glad you are okay.");
+    if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate([0, 60, 60, 60]);
+  }, [stopVibrate]);
+
+  const startFallAlert = useCallback(() => {
+    if (fallActiveRef.current) return;
+    fallActiveRef.current = true;
+    fallDetectorRef.current?.setSuppressed(true);
+
+    // Tell the cane to vibrate non-stop.
+    const c = clientRef.current;
+    if (c) { void c.setVibrate(true); }
+
+    // Big, distinctive phone buzz so user knows the alert started.
+    if (typeof navigator !== "undefined" && navigator.vibrate) {
+      navigator.vibrate([0, 400, 120, 400, 120, 400]);
+    }
+    speakUrgent("Possible fall detected. Press the cane button or the I'm OK button if you are okay. Otherwise help will be called in 25 seconds.");
+
+    const startedAt = performance.now();
+    setFallAlert({ active: true, startedAt, totalMs: FALL_COUNTDOWN_MS, remainingMs: FALL_COUNTDOWN_MS });
+
+    fallTickRef.current = window.setInterval(() => {
+      const remaining = Math.max(0, FALL_COUNTDOWN_MS - (performance.now() - startedAt));
+      setFallAlert((prev) => prev.active ? { ...prev, remainingMs: remaining } : prev);
+    }, 250);
+
+    fallTimerRef.current = window.setTimeout(async () => {
+      // Time's up — fire fall SOS + call.
+      fallTimerRef.current = null;
+      if (!fallActiveRef.current) return;
+      fallActiveRef.current = false;
+      if (fallTickRef.current !== null) { clearInterval(fallTickRef.current); fallTickRef.current = null; }
+      setFallAlert({ active: false, startedAt: 0, totalMs: FALL_COUNTDOWN_MS, remainingMs: 0 });
+      stopVibrate();
+      fallDetectorRef.current?.setSuppressed(false);
+      await triggerSos({ alsoCall: true, kind: "fall" });
+    }, FALL_COUNTDOWN_MS);
+  }, [stopVibrate, triggerSos]);
+
+  const simulateFall = useCallback(() => { startFallAlert(); }, [startFallAlert]);
+
+  // ------------- Connection / event wiring -------------
   const initClient = useCallback(() => {
     setClient((prev) => {
       if (prev) prev.disconnect();
       const host = getHost();
       const c = new ESP32Client(host);
+      clientRef.current = c;
 
       c.onState((s) => setState(s));
 
@@ -160,20 +260,49 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
 
       c.onSos((evt) => {
         setLastSos(evt);
-        // Hardware SOS button = full panic: SMS + call.
-        // Fire and forget — UI subscribes to lastSosOutcome for the result.
-        triggerSos({ alsoCall: true });
+        switch (evt.type) {
+          case "sos":
+            // Long-hold panic. If a fall alert is active, treat it as a
+            // confirmation cancel instead — the user is conscious.
+            if (fallActiveRef.current) {
+              cancelFallAlert();
+            } else {
+              triggerSos({ alsoCall: true });
+            }
+            break;
+          case "ack":
+            // Single click. ONLY meaningful while fall alert is showing.
+            if (fallActiveRef.current) cancelFallAlert();
+            break;
+          case "call1":
+            if (fallActiveRef.current) cancelFallAlert();
+            else void speedDial("person1");
+            break;
+          case "call2":
+            if (fallActiveRef.current) cancelFallAlert();
+            else void speedDial("person2");
+            break;
+        }
       });
 
       c.connect();
       return c;
     });
-  }, [triggerSos]);
+  }, [triggerSos, speedDial, cancelFallAlert]);
 
+  // Mount: connect ESP32 client + arm fall detector.
   useEffect(() => {
     initClient();
+    if (getFallDetectEnabled()) {
+      const fd = new FallDetector();
+      fallDetectorRef.current = fd;
+      fd.onFall(() => startFallAlert());
+      void fd.start();
+    }
     return () => {
-      // captured in initClient closure; nothing to clean here directly
+      fallDetectorRef.current?.stop();
+      if (fallTimerRef.current !== null) clearTimeout(fallTimerRef.current);
+      if (fallTickRef.current  !== null) clearInterval(fallTickRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -191,6 +320,9 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
         lastSos,
         lastSosOutcome,
         triggerSos,
+        fallAlert,
+        cancelFallAlert,
+        simulateFall,
       }}
     >
       {children}

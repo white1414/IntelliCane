@@ -131,9 +131,13 @@ export async function placeCall(phone: string): Promise<PlaceCallResult> {
 export function buildSosMessage(opts: {
   userName?: string;
   mapsLink: string;
+  kind?: "sos" | "fall";
 }): string {
-  const who = opts.userName?.trim()
-    ? `${opts.userName.trim()} is in danger`
-    : "Person in danger";
+  const name = opts.userName?.trim();
+  if (opts.kind === "fall") {
+    const who = name ? `${name} may have fallen` : "User may have fallen";
+    return `${who}. IntelliCane detected a possible fall and got no response. Location: ${opts.mapsLink}`;
+  }
+  const who = name ? `${name} is in danger` : "Person in danger";
   return `${who}. SOS — current location: ${opts.mapsLink}`;
 }

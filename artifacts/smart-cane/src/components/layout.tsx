@@ -4,10 +4,11 @@ import { Camera, Settings, Activity, Info, Volume2, VolumeX, ShieldAlert } from 
 import { useSmartCane } from "@/hooks/use-smart-cane";
 import { stopSpeaking } from "@/lib/tts";
 import { useToast } from "@/hooks/use-toast";
+import { FallAlertOverlay } from "@/components/fall-alert-overlay";
 
 export function Layout({ children }: { children: ReactNode }) {
   const [location] = useLocation();
-  const { state, audioMuted, setAudioMuted, triggerSos } = useSmartCane();
+  const { state, audioMuted, setAudioMuted, triggerSos, fallAlert, cancelFallAlert } = useSmartCane();
   const { toast } = useToast();
 
   const toggleMute = () => {
@@ -156,6 +157,13 @@ export function Layout({ children }: { children: ReactNode }) {
       <main className="flex-1 overflow-x-hidden flex flex-col relative pb-20">
         {children}
       </main>
+
+      <FallAlertOverlay
+        active={fallAlert.active}
+        remainingMs={fallAlert.remainingMs}
+        totalMs={fallAlert.totalMs}
+        onCancel={cancelFallAlert}
+      />
 
       <nav className="fixed bottom-0 left-0 right-0 border-t border-border bg-card/95 backdrop-blur-md pb-safe z-50">
         <div className="flex items-center justify-around p-2">
