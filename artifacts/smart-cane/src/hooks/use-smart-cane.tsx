@@ -274,8 +274,15 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
             }
             break;
           case "ack":
-            // Single click. ONLY meaningful while fall alert is showing.
-            if (fallActiveRef.current) cancelFallAlert();
+            // Single click. Cancels an active fall countdown; otherwise
+            // we still announce it so the user gets audible confirmation
+            // that the cane button (or a wire-to-GND test) is reaching
+            // the app — useful when bench-testing the GPIO15 hookup.
+            if (fallActiveRef.current) {
+              cancelFallAlert();
+            } else {
+              speakUrgent("Cane button received.");
+            }
             break;
           case "call1":
             if (fallActiveRef.current) cancelFallAlert();

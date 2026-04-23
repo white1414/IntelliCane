@@ -39,9 +39,20 @@ type SensorListener = (reading: SensorReading) => void;
 type StateListener  = (state: ConnState) => void;
 type SosListener    = (evt: SosEvent) => void;
 
-const SENSOR_POLL_MS = 100;   // 10 Hz
-const SOS_POLL_MS    = 1000;  // 1 Hz
-const SENSOR_FAIL_BACKOFF_MS = 1000;
+// Polling rates are deliberately conservative because the ESP32 httpd
+// has only ~13 sockets and is also serving a long-lived MJPEG stream
+// to the same phone. Hammering /sensors at 10 Hz used to fill the
+// socket pool within seconds, after which fetches started erroring
+// (errno 104 in the ESP-IDF logs), the JS flipped to state="error",
+// the <img> unmounted, and the user got the "connect to IntelliCane
+// WiFi" screen even though the SoftAP was still up.
+const SENSOR_POLL_MS = 250;   // 4 Hz — plenty for distance UI.
+const SOS_POLL_MS    = 700;   // ~1.4 Hz — catches even short presses.
+const SENSOR_FAIL_BACKOFF_MS = 1500;
+// We only flip to "error" after a sustained string of failures so a
+// single dropped poll (e.g. the camera tab swap) doesn't blow away
+// the live feed.
+const SENSOR_FAIL_ERROR_THRESHOLD = 8;
 
 export class ESP32Client {
   private host: string;
@@ -175,7 +186,7 @@ export class ESP32Client {
       // body.status === "idle" — Nano has not sent anything yet, just loop.
     } catch {
       this.failCount++;
-      if (this.failCount > 3) this.setState("error");
+      if (this.failCount >= SENSOR_FAIL_ERROR_THRESHOLD) this.setState("error");
     } finally {
       const delay = this.failCount > 0 ? SENSOR_FAIL_BACKOFF_MS : SENSOR_POLL_MS;
       this.scheduleSensorPoll(delay);

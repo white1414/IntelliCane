@@ -343,6 +343,34 @@ static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size  = 8192;
     config.max_uri_handlers = 12;
+    // ----------------------------------------------------------------
+    // Socket-pool tuning. Without these, the live feed dies after ~5–15 s.
+    //
+    // Why: the phone holds ONE long-lived socket on the MJPEG stream
+    // (GET /), and the JS client also polls /sensors and /sos. The
+    // default pool is 7 sockets with NO LRU eviction, so once Chromium
+    // racks up a few half-closed connections (every camera-tab unmount
+    // tears the MJPEG socket which the ESP server logs as "errno 104,
+    // ECONNRESET"), the pool fills, NEW fetches start being refused,
+    // and the JS flips state→"error" → it unmounts <img> → MJPEG dies →
+    // user sees the "make sure you connect to IntelliCane WiFi" screen.
+    //
+    // Fixes:
+    //   - lru_purge_enable: drop the oldest socket when full, instead
+    //     of refusing the new one.
+    //   - max_open_sockets: bump as high as CONFIG_LWIP_MAX_SOCKETS
+    //     allows on this build.
+    //   - recv/send_wait_timeout: short, so a half-dead Chromium socket
+    //     doesn't squat on a slot for a minute.
+    //   - keep_alive_enable=false: with only ~13 sockets total, we'd
+    //     rather have each /sensors poll close immediately and free a
+    //     slot than reuse one keep-alive socket per origin.
+    // ----------------------------------------------------------------
+    config.lru_purge_enable  = true;
+    config.max_open_sockets  = 13;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
+    config.keep_alive_enable = false;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start httpd");
