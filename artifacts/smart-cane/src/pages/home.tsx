@@ -7,7 +7,7 @@ import { announceDetection } from "@/lib/tts";
 import { useWakeLock } from "@/lib/wakeLock";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Play, Square, Loader2, WifiOff } from "lucide-react";
+import { Play, Square, Loader2, WifiOff, Accessibility, Wifi } from "lucide-react";
 
 export default function Home() {
   const { client, state, latestSensor, audioMuted } = useSmartCane();
@@ -308,55 +308,71 @@ export default function Home() {
           </Badge>
         </div>
 
-        {/* Sensor Dashboard */}
+        {/* Sensor Dashboard.
+            Reflects the actual physical sensor head: 1 ultrasonic at 0°
+            on top, plus 4 ToF lasers on the semicircular disc at ±20°
+            (inner) and ±45° (outer). The ground channel was removed —
+            the HC-SR04 was relabeled as the front (0°) channel. The
+            center cell of the bottom row is the IntelliCane logo, both
+            because there's no sixth sensor to put there and because
+            it visually anchors the surrounding readings around the
+            cane itself. */}
         <div className="bg-card rounded-2xl border border-border p-4 shadow-sm">
           <h3 className="text-sm font-medium text-muted-foreground uppercase tracking-wider mb-4 text-center">Distance Sensors</h3>
-          
-          {/* Spatial layout of sensors */}
+
           <div className="grid grid-cols-3 gap-3">
-            {/* Top row */}
-            <div className="flex flex-col items-center p-3 rounded-xl bg-background border border-border">
-              <span className="text-xs text-muted-foreground mb-1">Front Left</span>
-              <span className={`text-xl font-bold ${getDistanceColor(latestSensor?.fl ?? -1)}`}>
-                {latestSensor?.fl ?? "--"}<span className="text-xs ml-1 opacity-50">cm</span>
-              </span>
+            {/* Top row — outer-left (-45°), front (0°), outer-right (+45°). */}
+            <SensorCell label="Outer L" sublabel="-45°" cm={latestSensor?.outL ?? -1} colorFn={getDistanceColor} />
+            <SensorCell label="Front"   sublabel="0°"   cm={latestSensor?.front ?? -1} colorFn={getDistanceColor} />
+            <SensorCell label="Outer R" sublabel="+45°" cm={latestSensor?.outR ?? -1} colorFn={getDistanceColor} />
+
+            {/* Bottom row — inner-left (-20°), logo, inner-right (+20°). */}
+            <SensorCell label="Inner L" sublabel="-20°" cm={latestSensor?.inL ?? -1} colorFn={getDistanceColor} />
+
+            {/* Logo cell: a cane icon with a small wifi badge to evoke
+                "smart cane that senses around it". Uses the primary
+                accent so it pops against the neutral sensor cells. */}
+            <div
+              className="flex flex-col items-center justify-center p-3 rounded-xl bg-primary/10 border border-primary/30 relative overflow-hidden"
+              aria-hidden
+            >
+              <div className="relative">
+                <Accessibility className="w-9 h-9 text-primary stroke-[2.2px]" />
+                <Wifi className="w-4 h-4 text-primary absolute -top-1 -right-2 rotate-12" />
+              </div>
+              <span className="text-[10px] font-bold tracking-widest text-primary mt-1">INTELLICANE</span>
             </div>
-            <div className="flex flex-col items-center p-3 rounded-xl bg-background border border-border">
-              <span className="text-xs text-muted-foreground mb-1">Front</span>
-              <span className={`text-xl font-bold ${getDistanceColor(latestSensor?.front ?? -1)}`}>
-                {latestSensor?.front ?? "--"}<span className="text-xs ml-1 opacity-50">cm</span>
-              </span>
-            </div>
-            <div className="flex flex-col items-center p-3 rounded-xl bg-background border border-border">
-              <span className="text-xs text-muted-foreground mb-1">Front Right</span>
-              <span className={`text-xl font-bold ${getDistanceColor(latestSensor?.fr ?? -1)}`}>
-                {latestSensor?.fr ?? "--"}<span className="text-xs ml-1 opacity-50">cm</span>
-              </span>
-            </div>
-            
-            {/* Bottom row */}
-            <div className="flex flex-col items-center p-3 rounded-xl bg-background border border-border">
-              <span className="text-xs text-muted-foreground mb-1">Left</span>
-              <span className={`text-xl font-bold ${getDistanceColor(latestSensor?.left ?? -1)}`}>
-                {latestSensor?.left ?? "--"}<span className="text-xs ml-1 opacity-50">cm</span>
-              </span>
-            </div>
-            <div className="flex flex-col items-center p-3 rounded-xl bg-background border border-border">
-              <span className="text-xs text-muted-foreground mb-1">Ground</span>
-              <span className={`text-xl font-bold ${getDistanceColor(latestSensor?.ground ?? -1)}`}>
-                {latestSensor?.ground ?? "--"}<span className="text-xs ml-1 opacity-50">cm</span>
-              </span>
-            </div>
-            <div className="flex flex-col items-center p-3 rounded-xl bg-background border border-border">
-              <span className="text-xs text-muted-foreground mb-1">Right</span>
-              <span className={`text-xl font-bold ${getDistanceColor(latestSensor?.right ?? -1)}`}>
-                {latestSensor?.right ?? "--"}<span className="text-xs ml-1 opacity-50">cm</span>
-              </span>
-            </div>
+
+            <SensorCell label="Inner R" sublabel="+20°" cm={latestSensor?.inR ?? -1} colorFn={getDistanceColor} />
           </div>
         </div>
 
       </div>
+    </div>
+  );
+}
+
+// One distance readout cell. Pulled out so the 5 cells stay in sync if
+// we tweak typography or padding. `cm <= 0` means "no reading" and we
+// render a dim "--" instead of a misleading number.
+function SensorCell({
+  label,
+  sublabel,
+  cm,
+  colorFn,
+}: {
+  label: string;
+  sublabel: string;
+  cm: number;
+  colorFn: (cm: number) => string;
+}) {
+  return (
+    <div className="flex flex-col items-center p-3 rounded-xl bg-background border border-border">
+      <span className="text-xs text-muted-foreground mb-0.5">{label}</span>
+      <span className="text-[10px] text-muted-foreground/70 mb-1 font-mono">{sublabel}</span>
+      <span className={`text-xl font-bold ${colorFn(cm)}`}>
+        {cm > 0 ? cm : "--"}<span className="text-xs ml-1 opacity-50">cm</span>
+      </span>
     </div>
   );
 }

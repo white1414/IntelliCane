@@ -1,102 +1,16 @@
-import { ReactNode, useEffect, useRef } from "react";
+import { ReactNode, useEffect } from "react";
 import { Link, useLocation } from "wouter";
-import { Camera, Settings, Activity, Info, Volume2, VolumeX, ShieldAlert } from "lucide-react";
+import { Camera, Settings, Activity, Info } from "lucide-react";
 import { useSmartCane } from "@/hooks/use-smart-cane";
-import { stopSpeaking } from "@/lib/tts";
-import { useToast } from "@/hooks/use-toast";
 import { FallAlertOverlay } from "@/components/fall-alert-overlay";
 
+// Header used to also host the SOS hold-button and the audio mute
+// toggle. Both moved to the Diagnostics page so the Active screen
+// stays focused on the live feed and so they live alongside the rest
+// of the demo / hardware-test controls. See diagnostics.tsx.
 export function Layout({ children }: { children: ReactNode }) {
   const [location] = useLocation();
-  const { state, audioMuted, setAudioMuted, triggerSos, fallAlert, cancelFallAlert } = useSmartCane();
-  const { toast } = useToast();
-
-  const toggleMute = () => {
-    const newMuted = !audioMuted;
-    setAudioMuted(newMuted);
-    if (newMuted) {
-      stopSpeaking();
-      toast({ title: "Audio Muted", description: "Voice announcements disabled." });
-    } else {
-      toast({ title: "Audio Enabled", description: "Voice announcements enabled." });
-    }
-  };
-
-  const smsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const callTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const smsFired = useRef(false);
-
-  const SMS_HOLD_MS = 900;
-  const CALL_HOLD_MS = 2000;
-
-  const fireSos = async (alsoCall: boolean) => {
-    toast({
-      title: alsoCall ? "Sending SOS + calling" : "Sending SOS",
-      description: "Getting your location...",
-    });
-    const result = await triggerSos({ alsoCall });
-    toast({
-      title: result.ok ? (alsoCall ? "SOS sent + calling guardian" : "SOS triggered") : "SOS failed",
-      description: result.message,
-      variant: result.ok ? "default" : "destructive",
-    });
-  };
-
-  const clearSosTimers = () => {
-    if (smsTimer.current) {
-      clearTimeout(smsTimer.current);
-      smsTimer.current = null;
-    }
-    if (callTimer.current) {
-      clearTimeout(callTimer.current);
-      callTimer.current = null;
-    }
-  };
-
-  const handleSosPressStart = () => {
-    smsFired.current = false;
-    clearSosTimers();
-    smsTimer.current = setTimeout(() => {
-      smsFired.current = true;
-      if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(80);
-      fireSos(false);
-    }, SMS_HOLD_MS);
-    callTimer.current = setTimeout(() => {
-      if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate([0, 200, 80, 200]);
-      // Escalate: place the call. SMS already fired at 900ms, so call only.
-      placeCallEscalation();
-    }, CALL_HOLD_MS);
-  };
-
-  const placeCallEscalation = async () => {
-    // Direct call only — SMS has already gone out.
-    const { placeCall } = await import("@/lib/sms");
-    const { getGuardianPhone } = await import("@/lib/settings");
-    const phone = getGuardianPhone();
-    if (!phone) return;
-    toast({ title: "Calling guardian", description: "Placing emergency call..." });
-    const res = await placeCall(phone);
-    toast({
-      title: res.placed || res.openedDialer ? "Calling guardian" : "Call failed",
-      description: res.placed
-        ? "Call started."
-        : res.openedDialer
-        ? "Dialer opened — tap call."
-        : res.error ?? "Unknown error.",
-      variant: res.placed || res.openedDialer ? "default" : "destructive",
-    });
-  };
-
-  const handleSosPressEnd = () => {
-    clearSosTimers();
-  };
-
-  const handleSosClick = () => {
-    // Swallow the click — short taps do nothing; user must hold ≥ 900ms.
-    if (smsFired.current) {
-      smsFired.current = false;
-    }
-  };
+  const { state, fallAlert, cancelFallAlert } = useSmartCane();
 
   useEffect(() => {
     const ariaLive = document.getElementById("connection-status-aria");
@@ -120,37 +34,16 @@ export function Layout({ children }: { children: ReactNode }) {
           <h1 className="font-bold text-xl tracking-tight">IntelliCane</h1>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={handleSosClick}
-            onMouseDown={handleSosPressStart}
-            onMouseUp={handleSosPressEnd}
-            onMouseLeave={handleSosPressEnd}
-            onTouchStart={handleSosPressStart}
-            onTouchEnd={handleSosPressEnd}
-            onTouchCancel={handleSosPressEnd}
-            onContextMenu={(e) => e.preventDefault()}
-            className="px-3 py-2 rounded-full flex items-center gap-2 bg-destructive/15 text-destructive border border-destructive/30 active:scale-95 transition-transform font-semibold select-none"
-            aria-label="Send SOS to guardian. Hold for nearly one second to text. Keep holding for two seconds to also call."
-            data-testid="button-sos-header"
-          >
-            <ShieldAlert className="w-5 h-5" />
-            <span className="text-sm">SOS</span>
-          </button>
-
-          <button
-            onClick={toggleMute}
-            className={`p-3 rounded-full flex items-center justify-center transition-colors ${
-              audioMuted
-                ? "bg-destructive/10 text-destructive border border-destructive/20"
-                : "bg-primary/10 text-primary border border-primary/20"
-            }`}
-            aria-label={audioMuted ? "Unmute audio" : "Mute audio"}
-            aria-pressed={!audioMuted}
-            data-testid="button-mute"
-          >
-            {audioMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
-          </button>
+        {/* Tiny live connection state in the header — replaces the
+            removed SOS / mute buttons. Full controls live on the
+            Diagnostics tab. */}
+        <div className="flex items-center gap-2 text-xs font-mono">
+          <span className={`inline-block w-2 h-2 rounded-full ${
+            state === "connected" ? "bg-green-400" :
+            state === "connecting" ? "bg-yellow-400 animate-pulse" :
+            "bg-red-400"
+          }`} />
+          <span className="opacity-70">{state}</span>
         </div>
       </header>
 

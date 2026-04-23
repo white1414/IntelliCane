@@ -12,15 +12,21 @@
  * poll succeeded (HTTP 200 + parseable JSON).
  */
 
+// Sensor head layout (see Nano firmware comment block):
+//   front = HC-SR04 ultrasonic at 0° dead-center
+//   inL   = ToF laser at -20° (near-left)
+//   inR   = ToF laser at +20° (near-right)
+//   outL  = ToF laser at -45° (far-left)
+//   outR  = ToF laser at +45° (far-right)
+// All distances are in cm; -1 means "no reading".
 export interface SensorReading {
   front: number;
-  fl: number;     // front-left
-  fr: number;     // front-right
-  left: number;   // alias kept for the rest of the app
-  right: number;  // alias kept for the rest of the app
-  side: number;
-  ground: number;
+  inL: number;
+  inR: number;
+  outL: number;
+  outR: number;
   alert: number;
+  fall?: number;
   ts: number;
   age_ms?: number;
 }
@@ -253,16 +259,18 @@ export class ESP32Client {
 
       if (body && body.data && typeof body.data === "object") {
         const d = body.data;
+        // Fall back to legacy keys (fl/fr/side/ground) so an old Nano
+        // build still sort-of works during a partial flash, but the
+        // new keys (inL/inR/outL/outR/front) take precedence.
         const reading: SensorReading = {
-          front:  num(d.front),
-          fl:     num(d.fl),
-          fr:     num(d.fr),
-          side:   num(d.side),
-          left:   num(d.fl),   // alias for downstream code
-          right:  num(d.fr),   // alias for downstream code
-          ground: num(d.ground),
-          alert:  d.alert ? 1 : 0,
-          ts:     Date.now(),
+          front: num(d.front),
+          inL:   num(d.inL  ?? d.fl),
+          inR:   num(d.inR  ?? d.fr),
+          outL:  num(d.outL ?? d.side),
+          outR:  num(d.outR ?? d.side),
+          alert: d.alert ? 1 : 0,
+          fall:  d.fall  ? 1 : 0,
+          ts:    Date.now(),
           age_ms: typeof body.age_ms === "number" ? body.age_ms : undefined,
         };
         for (const fn of this.sensorListeners) fn(reading);

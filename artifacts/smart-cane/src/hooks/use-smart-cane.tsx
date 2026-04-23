@@ -38,6 +38,14 @@ interface SmartCaneContextValue {
   cancelFallAlert: () => void;
   // Manual debug trigger for the fall flow (used by Settings → Test).
   simulateFall: () => void;
+  // Last 5 cane-button events with timestamps, newest first. Surfaced
+  // on the Diagnostics page so a sighted helper / judge can replay
+  // the last few presses without re-pressing the physical button.
+  sosHistory: SosEvent[];
+  // Push a synthetic button event through the same pipeline the real
+  // button uses (drives speech, fall-cancel, speed-dial, the lot).
+  // Diagnostics has 4 buttons that call this for demos.
+  simulateSos: (type: SosEvent["type"]) => void;
 }
 
 const SmartCaneContext = createContext<SmartCaneContextValue | undefined>(undefined);
@@ -51,6 +59,7 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
   const [sensorLog, setSensorLog] = useState<SensorReading[]>([]);
   const [audioMuted, setAudioMuted] = useState(false);
   const [lastSos, setLastSos] = useState<SosEvent | null>(null);
+  const [sosHistory, setSosHistory] = useState<SosEvent[]>([]);
   const [lastSosOutcome, setLastSosOutcome] = useState<SosOutcome | null>(null);
   const [fallAlert, setFallAlert] = useState<FallAlertState>({
     active: false, startedAt: 0, totalMs: FALL_COUNTDOWN_MS, remainingMs: 0,
@@ -223,6 +232,34 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
 
   const simulateFall = useCallback(() => { startFallAlert(); }, [startFallAlert]);
 
+  // Diagnostics-page hook that synthesizes a button event so a judge
+  // can demo all 4 SOS modes (sos / call1 / call2 / ack) on stage
+  // without anyone having to short the physical button. Goes through
+  // the SAME handler the real /sos poll uses.
+  const simulateSos = useCallback((type: SosEvent["type"]) => {
+    const evt: SosEvent = { type, time: Date.now(), receivedAt: Date.now() };
+    setLastSos(evt);
+    setSosHistory((prev) => [evt, ...prev].slice(0, 5));
+    switch (type) {
+      case "sos":
+        if (fallActiveRef.current) cancelFallAlert();
+        else void triggerSos({ alsoCall: true });
+        break;
+      case "ack":
+        if (fallActiveRef.current) cancelFallAlert();
+        else speakUrgent("Cane button received.");
+        break;
+      case "call1":
+        if (fallActiveRef.current) cancelFallAlert();
+        else void speedDial("person1");
+        break;
+      case "call2":
+        if (fallActiveRef.current) cancelFallAlert();
+        else void speedDial("person2");
+        break;
+    }
+  }, [triggerSos, speedDial, cancelFallAlert]);
+
   // ------------- Connection / event wiring -------------
   const initClient = useCallback(() => {
     setClient((prev) => {
@@ -239,17 +276,29 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
 
         if (audioMutedRef.current) return;
 
-        let nearestDir: "front" | "left" | "right" | null = null;
+        // Pick the closest of the 5 channels and translate it into a
+        // human-friendly direction word that matches the actual sensor
+        // mounting (see Nano firmware comment block):
+        //   front (0°)            -> "ahead"
+        //   inL (-20°), inR(+20)  -> "front-left" / "front-right"
+        //   outL(-45°), outR(+45) -> "left" / "right"
+        // This is what the user complained about: with the old code
+        // we said "front" for a 20°-off-center ToF, which sounded wrong
+        // and made the speech feel imprecise.
+        type Dir = "ahead" | "front-left" | "front-right" | "left" | "right";
+        let nearestDir: Dir | null = null;
         let minDist = Infinity;
-        const check = (dist: number, dir: "front" | "left" | "right") => {
+        const check = (dist: number, dir: Dir) => {
           if (dist > 0 && dist < 80 && dist < minDist) {
             minDist = dist;
             nearestDir = dir;
           }
         };
-        check(reading.front, "front");
-        check(reading.fl, "left");
-        check(reading.fr, "right");
+        check(reading.front, "ahead");
+        check(reading.inL,   "front-left");
+        check(reading.inR,   "front-right");
+        check(reading.outL,  "left");
+        check(reading.outR,  "right");
 
         if (nearestDir) {
           const now = Date.now();
@@ -263,6 +312,7 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
 
       c.onSos((evt) => {
         setLastSos(evt);
+        setSosHistory((prev) => [evt, ...prev].slice(0, 5));
         switch (evt.type) {
           case "sos":
             // Long-hold panic. If a fall alert is active, treat it as a
@@ -333,6 +383,8 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
         fallAlert,
         cancelFallAlert,
         simulateFall,
+        sosHistory,
+        simulateSos,
       }}
     >
       {children}
