@@ -3,6 +3,7 @@ import { ESP32Client, SensorReading, ConnState, SosEvent } from "@/lib/esp32";
 import {
   getHost, getGuardianPhone, getUserName,
   getPerson1Phone, getPerson2Phone, getFallDetectEnabled,
+  getFallSensitivity,
 } from "@/lib/settings";
 import { announceObstacle, speakUrgent } from "@/lib/tts";
 import { getLocationOnce, googleMapsLink } from "@/lib/geo";
@@ -119,7 +120,9 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
       let callMsg = "";
       let callOk = true;
       if (alsoCall) {
-        const callRes = await placeCall(phone);
+        // SOS / fall calls always force speakerphone + max volume so the
+        // user can hear hands-free even if the phone is in their pocket.
+        const callRes = await placeCall(phone, { speakerOn: true, maxVolume: true });
         if (callRes.placed) {
           callMsg = " Calling guardian now.";
         } else if (callRes.openedDialer) {
@@ -161,7 +164,7 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
     }
     speakUrgent(`Calling ${label}.`);
     if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(60);
-    await placeCall(phone);
+    await placeCall(phone, { speakerOn: true, maxVolume: true });
   }, []);
 
   // ------------- Fall alert flow -------------
@@ -294,7 +297,7 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     initClient();
     if (getFallDetectEnabled()) {
-      const fd = new FallDetector();
+      const fd = new FallDetector(getFallSensitivity());
       fallDetectorRef.current = fd;
       fd.onFall(() => startFallAlert());
       void fd.start();

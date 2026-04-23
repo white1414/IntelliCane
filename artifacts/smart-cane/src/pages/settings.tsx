@@ -8,6 +8,7 @@ import {
   getPerson1Phone, setPerson1Phone,
   getPerson2Phone, setPerson2Phone,
   getFallDetectEnabled, setFallDetectEnabled,
+  getFallSensitivity, setFallSensitivity,
   getUserName, setUserName,
 } from "@/lib/settings";
 import { Button } from "@/components/ui/button";
@@ -31,6 +32,7 @@ export default function SettingsPage() {
   const [person1, setPerson1] = useState("");
   const [person2, setPerson2] = useState("");
   const [fallEnabled, setFallEnabled] = useState(true);
+  const [fallSens, setFallSens] = useState([5]);
   const [userName, setUserNameLocal] = useState("");
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   const [smsMode, setSmsMode] = useState<"native-silent" | "composer" | "none">("none");
@@ -43,6 +45,7 @@ export default function SettingsPage() {
     setPerson1(getPerson1Phone());
     setPerson2(getPerson2Phone());
     setFallEnabled(getFallDetectEnabled());
+    setFallSens([getFallSensitivity()]);
     setUserNameLocal(getUserName());
     setSmsMode(smsCapability());
 
@@ -65,8 +68,9 @@ export default function SettingsPage() {
     setPerson1Phone(person1);
     setPerson2Phone(person2);
     setFallDetectEnabled(fallEnabled);
+    setFallSensitivity(fallSens[0]);
     setUserName(userName);
-    toast({ title: "Saved", description: "Emergency contacts updated." });
+    toast({ title: "Saved", description: "Emergency contacts updated. Restart the app for fall sensitivity changes to take effect." });
   };
 
   const handleTestFall = () => {
@@ -232,6 +236,31 @@ export default function SettingsPage() {
             data-testid="switch-fall-detect"
           />
         </div>
+
+        {fallEnabled && (
+          <div className="space-y-3 pl-1">
+            <div className="flex justify-between">
+              <Label className="text-sm font-semibold">Fall sensitivity</Label>
+              <span className="font-mono bg-secondary px-2 rounded text-xs">
+                {fallSens[0]} / 10
+              </span>
+            </div>
+            <Slider
+              min={1} max={10} step={1}
+              value={fallSens}
+              onValueChange={(v) => { setFallSens(v); setFallSensitivity(v[0]); }}
+              className="py-2"
+              data-testid="slider-fall-sensitivity"
+            />
+            <div className="flex justify-between text-[10px] text-muted-foreground">
+              <span>1 — fires on small bumps</span>
+              <span>10 — only hard, fast impacts</span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Detection requires a sharp, high-jerk spike — picking the phone up slowly will not trigger an alert at any setting. Higher values reduce false positives if you're active. Restart the app after changing.
+            </p>
+          </div>
+        )}
 
         <div className="space-y-3">
           <Label htmlFor="username" className="text-base font-semibold">Your Name (optional)</Label>

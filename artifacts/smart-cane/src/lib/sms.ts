@@ -13,7 +13,7 @@ export interface SendSmsResult {
 
 interface SmsPlugin {
   send(opts: { numbers: string[]; text: string }): Promise<unknown>;
-  placeCall?(opts: { number: string }): Promise<unknown>;
+  placeCall?(opts: { number: string; speakerOn?: boolean; maxVolume?: boolean }): Promise<unknown>;
 }
 
 let cachedNative: SmsPlugin | null | undefined = undefined;
@@ -92,7 +92,16 @@ export interface PlaceCallResult {
   error?: string;
 }
 
-export async function placeCall(phone: string): Promise<PlaceCallResult> {
+export interface PlaceCallOptions {
+  // Force speakerphone on after the call connects (Android only — uses
+  // AudioManager.setSpeakerphoneOn). Useful for SOS / fall calls where
+  // the user needs to hear hands-free.
+  speakerOn?: boolean;
+  // Set the in-call (voice) stream to the device's maximum volume.
+  maxVolume?: boolean;
+}
+
+export async function placeCall(phone: string, opts?: PlaceCallOptions): Promise<PlaceCallResult> {
   const cleanedPhone = phone.replace(/[^\d+]/g, "");
   if (!cleanedPhone) {
     return { placed: false, openedDialer: false, error: "No phone number set." };
@@ -101,7 +110,11 @@ export async function placeCall(phone: string): Promise<PlaceCallResult> {
   const native = getNativeSms();
   if (native?.placeCall) {
     try {
-      await native.placeCall({ number: cleanedPhone });
+      await native.placeCall({
+        number: cleanedPhone,
+        speakerOn: opts?.speakerOn ?? false,
+        maxVolume: opts?.maxVolume ?? false,
+      });
       return { placed: true, openedDialer: false };
     } catch (e) {
       return {

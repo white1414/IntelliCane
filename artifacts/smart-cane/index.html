@@ -11,15 +11,20 @@
     <link rel="manifest" href="./manifest.webmanifest" />
     <title>IntelliCane</title>
     <!--
-      Load the tfjs-tflite runtime via a classic <script> from /tflite-wasm/.
-      This MUST come before the module bundle so window.tflite is defined by
-      the time yolo.ts touches it. We deliberately do NOT import
-      "@tensorflow/tfjs-tflite" as an ES module anywhere — bundlers bake the
-      original node_modules URL into the build, which breaks inside the
-      Capacitor APK (no node_modules at runtime → SPA fallback → MIME error
-      → white screen). The script tag avoids that entirely.
+      Load TensorFlow.js + TFLite as classic UMD scripts from /tflite-wasm/.
+      Order matters: tf-core defines window.tf, the WASM backend registers
+      itself onto window.tf, then tf-tflite hangs window.tflite off it.
+
+      We deliberately do NOT bundle "@tensorflow/tfjs-tflite" through
+      Vite/Rollup. The package's internal loader resolves
+      `tflite_web_api_client.js` against `import.meta.url` of the SOURCE
+      file in node_modules — the bundler bakes that absolute dev URL into
+      the production output, which 404s inside the Capacitor APK and
+      causes a white-screen on launch.
     -->
-    <script src="./tflite-wasm/tflite_web_api_client.js"></script>
+    <script src="./tflite-wasm/tf-core.min.js"></script>
+    <script src="./tflite-wasm/tf-backend-wasm.min.js"></script>
+    <script src="./tflite-wasm/tf-tflite.min.js"></script>
   </head>
   <body>
     <div id="root"></div>

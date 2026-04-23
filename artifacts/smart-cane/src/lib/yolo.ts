@@ -1,28 +1,41 @@
-import * as tf from "@tensorflow/tfjs-core";
-import "@tensorflow/tfjs-backend-cpu";
-import { setWasmPaths } from "@tensorflow/tfjs-backend-wasm";
-// IMPORTANT: do NOT `import * as tflite from "@tensorflow/tfjs-tflite"` here.
-// The package is loaded at runtime via a classic <script> tag in index.html
-// (see public/tflite-wasm/tflite_web_api_client.js) and exposed as the
-// global `window.tflite`. Bundling it through Vite/Rollup bakes the
-// original node_modules URL into the production output, which 404s inside
-// the Capacitor APK and causes the WebView to render a white screen.
+// YOLO TFLite inference, using the UMD bundles loaded from index.html.
 //
-// We import the package only for its TypeScript types (no emitted import).
+// We do NOT import "@tensorflow/*" packages at runtime. They're loaded as
+// classic <script> tags in index.html and exposed as window.tf and
+// window.tflite. This is the only reliable way to ship tfjs-tflite inside
+// a Capacitor APK — bundling it via Vite/Rollup bakes the original
+// node_modules URL of `tflite_web_api_client.js` into the build, which
+// 404s on device and white-screens the app.
+//
+// We import *types only* so the rest of the file stays type-safe.
+import type * as TFCoreNS from "@tensorflow/tfjs-core";
 import type * as TFLiteNS from "@tensorflow/tfjs-tflite";
 import { CLASS_NAMES } from "./labels";
 
 declare global {
   interface Window {
+    tf?: typeof TFCoreNS & {
+      wasm?: { setWasmPaths?: (path: string) => void };
+    };
     tflite?: typeof TFLiteNS;
   }
+}
+
+function getTf(): typeof TFCoreNS {
+  const t = window.tf;
+  if (!t) {
+    throw new Error(
+      "TensorFlow.js not loaded. Check that <script src=\"./tflite-wasm/tf-core.min.js\"> is in index.html and the file exists in public/tflite-wasm/.",
+    );
+  }
+  return t;
 }
 
 function getTflite(): typeof TFLiteNS {
   const t = window.tflite;
   if (!t) {
     throw new Error(
-      "tfjs-tflite runtime not loaded. Make sure <script src=\"./tflite-wasm/tflite_web_api_client.js\"></script> is present in index.html and that the file exists in public/tflite-wasm/.",
+      "tfjs-tflite not loaded. Check that <script src=\"./tflite-wasm/tf-tflite.min.js\"> is in index.html and the file exists in public/tflite-wasm/.",
     );
   }
   return t;
@@ -49,17 +62,25 @@ export async function loadModel(modelUrl: string): Promise<TFLiteNS.TFLiteModel>
   if (model) return model;
   if (loading) return loading;
 
+  const tf = getTf();
   const tflite = getTflite();
 
-  // Serve WASM from the bundled /tflite-wasm folder so it works on the
-  // ESP32-CAM SoftAP (no internet) once the APK is installed.
+  // Serve all WASM blobs from the bundled /tflite-wasm/ folder so the
+  // app works fully offline once installed (the cane has no internet —
+  // the phone is joined to the ESP32 SoftAP).
   const base = import.meta.env.BASE_URL.replace(/\/$/, "") + "/tflite-wasm/";
-  setWasmPaths(base);
+  // tfjs-backend-wasm path (used as the tf-core backend for pre/post-processing).
+  tf.wasm?.setWasmPaths?.(base);
+  // tfjs-tflite C++ runtime path.
   tflite.setWasmPath(base);
+
+  await tf.setBackend("wasm").catch(() => tf.setBackend("cpu"));
   await tf.ready();
 
   loading = tflite
-    .loadTFLiteModel(modelUrl, { numThreads: Math.min(4, navigator.hardwareConcurrency || 2) })
+    .loadTFLiteModel(modelUrl, {
+      numThreads: Math.min(4, navigator.hardwareConcurrency || 2),
+    })
     .then((m) => {
       model = m;
       return m;
@@ -75,7 +96,8 @@ export function isModelLoaded(): boolean {
 function preprocess(
   source: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
   scratchCanvas: HTMLCanvasElement,
-): { tensor: tf.Tensor; scale: number; padX: number; padY: number; srcW: number; srcH: number } {
+): { tensor: TFCoreNS.Tensor; scale: number; padX: number; padY: number; srcW: number; srcH: number } {
+  const tf = getTf();
   const srcW =
     (source as HTMLVideoElement).videoWidth ||
     (source as HTMLImageElement).naturalWidth ||
@@ -98,12 +120,10 @@ function preprocess(
   ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
   ctx.drawImage(source, padX, padY, newW, newH);
 
-  // Build [1, H, W, 3] float32 in 0..1 — matches the standard ultralytics
-  // TFLite export (NHWC). For INT8 models the runtime will quantize on entry.
   const imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
   const data = new Float32Array(INPUT_SIZE * INPUT_SIZE * 3);
   for (let i = 0, j = 0; i < imgData.length; i += 4, j += 3) {
-    data[j] = imgData[i] / 255;
+    data[j]     = imgData[i]     / 255;
     data[j + 1] = imgData[i + 1] / 255;
     data[j + 2] = imgData[i + 2] / 255;
   }
@@ -149,38 +169,33 @@ export async function detect(
   options?: { confThreshold?: number; iouThreshold?: number },
 ): Promise<Detection[]> {
   if (!model) throw new Error("Model not loaded yet");
+  const tf = getTf();
   const confThreshold = options?.confThreshold ?? 0.4;
   const iouThreshold = options?.iouThreshold ?? 0.45;
 
-  const { tensor, scale, padX, padY, srcW, srcH } = preprocess(
-    source,
-    scratchCanvas,
-  );
+  const { tensor, scale, padX, padY, srcW, srcH } = preprocess(source, scratchCanvas);
 
-  let outputs: tf.Tensor | tf.Tensor[] | { [n: string]: tf.Tensor };
+  let outputs: TFCoreNS.Tensor | TFCoreNS.Tensor[] | { [n: string]: TFCoreNS.Tensor };
   try {
-    outputs = model.predict(tensor) as tf.Tensor | tf.Tensor[];
+    outputs = model.predict(tensor) as TFCoreNS.Tensor | TFCoreNS.Tensor[];
   } finally {
     tensor.dispose();
   }
 
-  // Pull the first output tensor.
-  let out: tf.Tensor;
+  let out: TFCoreNS.Tensor;
   if (Array.isArray(outputs)) {
     out = outputs[0];
   } else if (outputs instanceof tf.Tensor) {
     out = outputs;
   } else {
-    out = Object.values(outputs)[0] as tf.Tensor;
+    out = Object.values(outputs)[0] as TFCoreNS.Tensor;
   }
 
-  // Ultralytics TFLite YOLOv8 output shape can be [1, 4+nc, 8400] OR
-  // [1, 8400, 4+nc] depending on export options. Detect by dim values.
   const dims = out.shape;
   const data = (await out.data()) as Float32Array;
   out.dispose();
   if (Array.isArray(outputs)) {
-    for (let i = 1; i < outputs.length; i++) (outputs as tf.Tensor[])[i].dispose();
+    for (let i = 1; i < outputs.length; i++) (outputs as TFCoreNS.Tensor[])[i].dispose();
   }
 
   const expectedAttrs = 4 + NUM_CLASSES;
@@ -203,8 +218,6 @@ export async function detect(
       ? data[anchor * expectedAttrs + attr]
       : data[attr * numAnchors + anchor];
 
-  // Some TFLite exports keep the model input range at 0..640, others at 0..1.
-  // Sniff once: if max coord is <=1.5 we assume normalized coords.
   let coordsAreNormalized = false;
   {
     const cx0 = get(0, 0);
@@ -231,8 +244,8 @@ export async function detect(
 
     const cx = get(i, 0) * coordScale;
     const cy = get(i, 1) * coordScale;
-    const w = get(i, 2) * coordScale;
-    const h = get(i, 3) * coordScale;
+    const w  = get(i, 2) * coordScale;
+    const h  = get(i, 3) * coordScale;
 
     const x = (cx - w / 2 - padX) / scale;
     const y = (cy - h / 2 - padY) / scale;

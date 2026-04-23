@@ -10,6 +10,7 @@ const PERSON1_KEY   = "intellicane.person1Phone";
 const PERSON2_KEY   = "intellicane.person2Phone";
 const USER_NAME_KEY = "intellicane.userName";
 const FALL_DETECT_KEY = "intellicane.fallDetectEnabled";
+const FALL_SENSITIVITY_KEY = "intellicane.fallSensitivity";
 
 // Backwards-compat: read old smartcane.* keys if no new value exists.
 function read(key: string, legacy: string, fallback: string): string {
@@ -74,6 +75,19 @@ export function getFallDetectEnabled(): boolean {
 export function setFallDetectEnabled(v: boolean) {
   if (typeof localStorage === "undefined") return;
   localStorage.setItem(FALL_DETECT_KEY, v ? "1" : "0");
+}
+
+// 1 (most sensitive — small bumps trigger) → 10 (least sensitive — only
+// hard, fast impacts trigger). Default 5.
+export function getFallSensitivity(): number {
+  const v = parseInt(read(FALL_SENSITIVITY_KEY, "", "5"), 10);
+  if (!Number.isFinite(v)) return 5;
+  return Math.max(1, Math.min(10, v));
+}
+export function setFallSensitivity(v: number) {
+  if (typeof localStorage === "undefined") return;
+  const clamped = Math.max(1, Math.min(10, Math.round(v)));
+  localStorage.setItem(FALL_SENSITIVITY_KEY, String(clamped));
 }
 
 export function getUserName(): string {

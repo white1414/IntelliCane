@@ -39,11 +39,12 @@ export default defineConfig({
     },
     dedupe: ["react", "react-dom"],
   },
-  // tfjs-tflite is loaded via a <script> tag in index.html and consumed as
-  // window.tflite — see src/lib/yolo.ts. We deliberately do NOT bundle it.
-  // The previous optimizeDeps.exclude + rollupOptions.external trick was
-  // baking the absolute node_modules URL into the production bundle, which
-  // 404s inside the Capacitor APK and causes a white screen.
+  // tfjs-core / tfjs-backend-wasm / tfjs-tflite are loaded via <script> tags
+  // in index.html and consumed as window.tf / window.tflite — see
+  // src/lib/yolo.ts. We do NOT bundle them through Vite. The previous
+  // optimizeDeps.exclude + rollupOptions.external trick baked the absolute
+  // node_modules URL of tflite_web_api_client.js into the production bundle,
+  // which 404s inside the Capacitor APK and white-screens the app.
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
