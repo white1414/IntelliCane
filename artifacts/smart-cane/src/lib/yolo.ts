@@ -193,7 +193,15 @@ function preprocess(
   ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
   ctx.drawImage(source, padX, padY, newW, newH);
 
-  const imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+  let imgData: Uint8ClampedArray;
+  try {
+    imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+  } catch (e) {
+    throw new Error(
+      "Canvas tainted — cannot read pixels. If using an <img> with crossOrigin, " +
+      "remove it or ensure the server sends correct CORS headers for MJPEG streams.",
+    );
+  }
   const data = new Float32Array(INPUT_SIZE * INPUT_SIZE * 3);
   for (let i = 0, j = 0; i < imgData.length; i += 4, j += 3) {
     data[j]     = imgData[i]     / 255;

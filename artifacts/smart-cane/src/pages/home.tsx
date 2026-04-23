@@ -64,43 +64,47 @@ export default function Home() {
       const targetFps = getTargetFps();
       const intervalMs = 1000 / targetFps;
       const confThresh = getConfThreshold();
+      let detecting = false;
 
       const loop = async () => {
+        if (!isRunning || !modelReady) return;
         const now = Date.now();
-        if (now - lastDetectTime.current >= intervalMs) {
+        if (!detecting && now - lastDetectTime.current >= intervalMs) {
           lastDetectTime.current = now;
-          if (imgRef.current && scratchCanvasRef.current) {
+          detecting = true;
+          const img = imgRef.current;
+          const scratch = scratchCanvasRef.current;
+          if (img && scratch && img.naturalWidth > 0 && img.naturalHeight > 0) {
             try {
               const start = performance.now();
-              const detections = await detect(imgRef.current, scratchCanvasRef.current, {
+              const detections = await detect(img, scratch, {
                 confThreshold: confThresh
               });
               const end = performance.now();
               setInfTime(Math.round(end - start));
               setFps(Math.round(1000 / (end - start)));
-              
+
               drawDetections(detections);
-              
+
               if (detections.length > 0 && !audioMuted) {
-                // announce the most confident detection
                 announceDetection(detections[0].className);
               }
             } catch (e) {
-              console.error("Detect error", e);
+              console.warn("[YOLO] Detection tick failed:", e);
             }
           }
+          detecting = false;
         }
         loopRef.current = requestAnimationFrame(loop);
       };
-      
+
       loopRef.current = requestAnimationFrame(loop);
-      
+
       return () => {
         if (loopRef.current) cancelAnimationFrame(loopRef.current);
       };
     } else {
       if (loopRef.current) cancelAnimationFrame(loopRef.current);
-      // clear canvas
       if (drawCanvasRef.current) {
         const ctx = drawCanvasRef.current.getContext("2d");
         if (ctx) ctx.clearRect(0, 0, drawCanvasRef.current.width, drawCanvasRef.current.height);
@@ -184,7 +188,6 @@ export default function Home() {
             <img
               ref={imgRef}
               src={client.streamUrl}
-              crossOrigin="anonymous"
               className={`absolute inset-0 w-full h-full object-contain transition-opacity ${state === "connected" ? "opacity-100" : "opacity-50"}`}
               alt="Live feed from smart cane"
               onLoad={() => {

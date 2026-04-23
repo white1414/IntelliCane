@@ -257,6 +257,9 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
         if (fallActiveRef.current) cancelFallAlert();
         else void speedDial("person2");
         break;
+      case "led":
+        speakUrgent("Flashlight toggled.");
+        break;
     }
   }, [triggerSos, speedDial, cancelFallAlert]);
 
@@ -341,6 +344,10 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
           case "call2":
             if (fallActiveRef.current) cancelFallAlert();
             else void speedDial("person2");
+            break;
+          case "led":
+            // 4 quick clicks toggled the built-in LED. Announce it.
+            speakUrgent("Flashlight toggled.");
             break;
         }
       });

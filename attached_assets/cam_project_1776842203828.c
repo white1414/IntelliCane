@@ -91,6 +91,9 @@ static const char *TAG = "intellicane";
 #define CLICK_MAX_PRESS_MS      600   // press shorter than this counts as a click
 #define CLICK_GROUP_GAP_MS      500   // gap between clicks to be considered same group
 
+/* ---------------- Built-in LED (AI-Thinker ESP32-CAM flash LED on GPIO 4) ---------------- */
+#define BUILTIN_LED_GPIO       4
+
 /* ---------------- Nano UART link (bidirectional) ---------------- */
 #define NANO_UART_NUM   UART_NUM_2
 #define NANO_UART_RX    14
@@ -112,6 +115,7 @@ typedef enum {
     EV_CALL1,
     EV_CALL2,
     EV_ACK,
+    EV_LED_TOGGLE,  // 4 quick clicks toggles the built-in LED
 } btn_event_t;
 
 static volatile btn_event_t s_pending_event = EV_NONE;
@@ -123,6 +127,9 @@ static char        g_sensors_json[SENSOR_LINE_MAX] = "";
 static int64_t     g_sensors_ts_ms                  = 0;
 static portMUX_TYPE s_sensors_mux                   = portMUX_INITIALIZER_UNLOCKED;
 
+/* LED state: toggled by 4 quick clicks or via /led endpoint */
+static volatile bool s_led_on = false;
+
 /* Forward declarations */
 void  i2c_init(void);
 static esp_err_t      camera_init_board(void);
@@ -133,12 +140,14 @@ static esp_err_t      sos_handler(httpd_req_t *req);
 static esp_err_t      sensors_handler(httpd_req_t *req);
 static esp_err_t      vibrate_handler(httpd_req_t *req);
 static esp_err_t      health_handler(httpd_req_t *req);
+static esp_err_t      led_handler(httpd_req_t *req);
 static httpd_handle_t start_webserver(void);
 static void           sos_button_init(void);
 static void           sos_button_task(void *arg);
 static void           nano_uart_init(void);
 static void           nano_uart_task(void *arg);
 static void           push_event(btn_event_t ev);
+static void           builtin_led_set(bool on);
 
 /* ---------------- I2C init ---------------- */
 void i2c_init() {
@@ -268,6 +277,7 @@ static esp_err_t frame_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
     esp_camera_fb_return(fb);
     return res;
@@ -289,13 +299,15 @@ static esp_err_t sos_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
 
     const char *type_str = "idle";
     switch (ev) {
-        case EV_SOS:   type_str = "sos";   break;
-        case EV_CALL1: type_str = "call1"; break;
-        case EV_CALL2: type_str = "call2"; break;
-        case EV_ACK:   type_str = "ack";   break;
+        case EV_SOS:        type_str = "sos";   break;
+        case EV_CALL1:      type_str = "call1"; break;
+        case EV_CALL2:      type_str = "call2"; break;
+        case EV_ACK:        type_str = "ack";   break;
+        case EV_LED_TOGGLE: type_str = "led";   break;
         default: break;
     }
 
@@ -328,6 +340,7 @@ static esp_err_t sensors_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     if (!have_data) {
         const char *msg = "{\"status\":\"idle\"}";
         return httpd_resp_send(req, msg, strlen(msg));
@@ -378,6 +391,7 @@ static esp_err_t vibrate_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     char resp[48];
     int len = snprintf(resp, sizeof(resp), "{\"vibrate\":%s}", on ? "true" : "false");
     return httpd_resp_send(req, resp, len);
@@ -393,14 +407,46 @@ static esp_err_t health_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
 
     char resp[192];
     int len = snprintf(resp, sizeof(resp),
         "{\"ok\":true,\"uptime_ms\":%lld,\"free_heap\":%u,"
-        "\"stream_port\":81,\"version\":\"v2.1\"}",
+        "\"stream_port\":81,\"version\":\"v2.2\"}",
         (long long)(esp_timer_get_time() / 1000LL),
         (unsigned)esp_get_free_heap_size());
     return httpd_resp_send(req, resp, len);
+}
+
+/* ---------------- /led endpoint (GET) ---------------- */
+//
+// Query params: ?on=1 or ?on=0 to turn the built-in LED on/off.
+// No query params: returns current LED state.
+// The LED is also toggled by 4 quick clicks of the SOS button.
+static esp_err_t led_handler(httpd_req_t *req) {
+    char query[32];
+    char val[8] = {0};
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "on", val, sizeof(val)) == ESP_OK) {
+            bool on = (val[0] == '1' || val[0] == 't' || val[0] == 'T');
+            builtin_led_set(on);
+        }
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    char resp[48];
+    int len = snprintf(resp, sizeof(resp), "{\"led\":%s}", s_led_on ? "true" : "false");
+    return httpd_resp_send(req, resp, len);
+}
+
+/* ---------------- Built-in LED control ---------------- */
+static void builtin_led_set(bool on) {
+    s_led_on = on;
+    gpio_set_level(BUILTIN_LED_GPIO, on ? 1 : 0);
 }
 
 // CORS preflight handler — browsers send OPTIONS before any cross-origin
@@ -490,6 +536,7 @@ static httpd_handle_t start_control_server(void) {
     httpd_uri_t sensors_uri  = { .uri="/sensors",   .method=HTTP_GET,    .handler=sensors_handler };
     httpd_uri_t vibrate_uri  = { .uri="/vibrate",   .method=HTTP_POST,   .handler=vibrate_handler };
     httpd_uri_t health_uri   = { .uri="/health",    .method=HTTP_GET,    .handler=health_handler };
+    httpd_uri_t led_uri      = { .uri="/led",       .method=HTTP_GET,    .handler=led_handler };
 
     // CORS preflight — register for EVERY endpoint path. Browsers send
     // OPTIONS before any cross-origin request, not just POST. If we only
@@ -501,17 +548,20 @@ static httpd_handle_t start_control_server(void) {
     httpd_uri_t opts_sensors = { .uri="/sensors",   .method=HTTP_OPTIONS, .handler=options_handler };
     httpd_uri_t opts_vibrate = { .uri="/vibrate",   .method=HTTP_OPTIONS, .handler=options_handler };
     httpd_uri_t opts_health  = { .uri="/health",     .method=HTTP_OPTIONS, .handler=options_handler };
+    httpd_uri_t opts_led     = { .uri="/led",       .method=HTTP_OPTIONS, .handler=options_handler };
 
     httpd_register_uri_handler(server, &frame_uri);
     httpd_register_uri_handler(server, &sos_uri);
     httpd_register_uri_handler(server, &sensors_uri);
     httpd_register_uri_handler(server, &vibrate_uri);
     httpd_register_uri_handler(server, &health_uri);
+    httpd_register_uri_handler(server, &led_uri);
     httpd_register_uri_handler(server, &opts_frame);
     httpd_register_uri_handler(server, &opts_sos);
     httpd_register_uri_handler(server, &opts_sensors);
     httpd_register_uri_handler(server, &opts_vibrate);
     httpd_register_uri_handler(server, &opts_health);
+    httpd_register_uri_handler(server, &opts_led);
 
     ESP_LOGI(TAG, "Control HTTP server up on :80 (free heap %u)",
              (unsigned)esp_get_free_heap_size());
@@ -657,9 +707,15 @@ static void sos_button_task(void *arg) {
             } else if (click_count == 2) {
                 ESP_LOGI(TAG, "double click -> CALL1");
                 push_event(EV_CALL1);
-            } else {
-                ESP_LOGI(TAG, "triple+ click -> CALL2");
+            } else if (click_count == 3) {
+                ESP_LOGI(TAG, "triple click -> CALL2");
                 push_event(EV_CALL2);
+            } else {
+                // 4+ quick clicks: toggle the built-in LED
+                ESP_LOGI(TAG, "%d clicks -> LED toggle", click_count);
+                bool new_state = !s_led_on;
+                builtin_led_set(new_state);
+                push_event(EV_LED_TOGGLE);
             }
             click_count = 0;
         }
@@ -739,6 +795,17 @@ void app_main(void) {
     sos_button_init();
     xTaskCreate(sos_button_task, "sos_task", 4096, NULL, 10, NULL);
 
+    // Initialize built-in LED GPIO (AI-Thinker ESP32-CAM flash LED on GPIO 4)
+    gpio_config_t led_conf = {
+        .pin_bit_mask = (1ULL << BUILTIN_LED_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&led_conf);
+    builtin_led_set(false);  // start with LED off
+
     nano_uart_init();
     xTaskCreate(nano_uart_task, "nano_uart", 4096, NULL, 9, NULL);
 
@@ -749,5 +816,6 @@ void app_main(void) {
         "  Sensors:  http://192.168.4.1/sensors\n"
         "  SOS poll: http://192.168.4.1/sos\n"
         "  Vibrate:  POST http://192.168.4.1/vibrate?on=1\n"
+        "  LED:      GET http://192.168.4.1/led?on=1  (4 quick clicks toggles)\n"
         "  Health:   http://192.168.4.1/health");
 }

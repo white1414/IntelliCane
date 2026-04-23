@@ -69,6 +69,7 @@ That's the elevator pitch. The rest of this document explains *how*.
    │  │     GET /sensors  → latest Nano JSON + age              │    │
    │  │     GET /sos      → next button event (long-poll)       │    │
    │  │     POST /vibrate?on=1|0 → tells Nano to buzz           │    │
+   │  │     GET /led?on=1|0 → built-in flash LED on/off        │    │
    │  │     GET /health   → uptime, free heap, version          │    │
    │  └─────────────────────────────────────────────────────────┘    │
    │  ┌─────────────────────────────────────────────────────────┐    │
@@ -217,11 +218,12 @@ File: [`attached_assets/cam_project_1776842203828.c`](attached_assets/cam_projec
 1. Brings up the camera (OV2640) at QVGA 320×240 JPEG, quality 12.
 2. Starts a SoftAP with SSID `IntelliCane` (WPA2, password compiled in). Default IP is `192.168.4.1`.
 3. Starts UART2 on GPIO13/14 at 9600 baud and a background task that parses one JSON line at a time from the Nano into a thread-safe latest-reading struct.
-4. Configures GPIO15 as input-pullup with an interrupt on falling edge. Press time is measured in the ISR; on release the press duration is classified into one of:
-   - **`ack`** — short tap (< 700 ms)
-   - **`call1`** — medium hold (700–1500 ms)
-   - **`call2`** — long-medium hold (1500–2500 ms)
-   - **`sos`** — long hold (≥ 2500 ms)
+4. Configures GPIO15 as input-pullup with a background task that polls the button every 20 ms. Press duration and click count are classified into one of:
+   - **`ack`** — single quick tap (< 600 ms)
+   - **`call1`** — 2 quick taps
+   - **`call2`** — 3 quick taps
+   - **`led`** — 4+ quick taps (toggles the built-in flash LED)
+   - **`sos`** — long hold (≥ 2 s)
    The event is pushed onto a small queue.
 5. Starts **two** HTTP servers:
    - **Control** on port **80** with 4 sockets.
@@ -236,6 +238,7 @@ The split is critical: we keep the long-lived MJPEG socket on its own server so 
 | GET    | `/sensors`  | Returns `{ status:"ok", age_ms, data: <Nano JSON> }`.        |
 | GET    | `/sos`      | Long-poll the next button event from the queue (or `{type:"none"}` after a timeout). |
 | POST   | `/vibrate`  | `?on=1` or `?on=0` — forwards `'V'` / `'S'` to the Nano.     |
+| GET    | `/led`      | `?on=1` or `?on=0` — turns the built-in flash LED on/off. Also toggled by 4 quick button clicks. |
 | GET    | `/health`   | `{ ok, uptime_ms, free_heap, stream_port, version }`.        |
 | GET    | `/stream`   | (port 81) MJPEG `multipart/x-mixed-replace` boundary stream. |
 
@@ -340,11 +343,12 @@ A typical "person walks in front of the user" cycle:
 ```
 press duration   →  event type   →  app behaviour
 ─────────────────────────────────────────────────────────────────────
-< 700 ms             ack             "Cane button received." TTS;
-                                     also cancels an active fall countdown.
-700–1500 ms          call1           Speed-dial "Person 1" with speaker on.
-1500–2500 ms         call2           Speed-dial "Person 2" with speaker on.
-≥ 2500 ms            sos             SMS guardian + call guardian (speaker on, max volume).
+1 quick tap           ack             "Cane button received." TTS;
+                                      also cancels an active fall countdown.
+2 quick taps          call1           Speed-dial "Person 1" with speaker on.
+3 quick taps          call2           Speed-dial "Person 2" with speaker on.
+4+ quick taps        led             Toggle the built-in flash LED on/off.
+≥ 2 s hold            sos             SMS guardian + call guardian (speaker on, max volume).
 ```
 
 Inside the app there's an additional press-and-hold SOS on the diagnostics page with its own thresholds (0.9 s text, 2 s call) for when the cane button isn't reachable.

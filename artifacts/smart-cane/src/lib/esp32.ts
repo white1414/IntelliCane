@@ -38,7 +38,7 @@ export interface SensorReading {
   age_ms?: number;
 }
 
-export type ButtonEventType = "sos" | "call1" | "call2" | "ack";
+export type ButtonEventType = "sos" | "call1" | "call2" | "ack" | "led";
 
 export interface SosEvent {
   type: ButtonEventType;
@@ -206,6 +206,24 @@ export class ESP32Client {
     }
   }
 
+  // GET /led?on=1|0 — controls the built-in flash LED on the ESP32-CAM.
+  // Also toggled by 4 quick clicks of the cane button.
+  async setLed(on: boolean): Promise<boolean> {
+    try {
+      const ctrl = new AbortController();
+      const tid = window.setTimeout(() => ctrl.abort(), 2000);
+      const resp = await fetch(`http://${this.host}/led?on=${on ? 1 : 0}`, {
+        cache: "no-store",
+        signal: ctrl.signal,
+      });
+      window.clearTimeout(tid);
+      await resp.text();
+      return resp.ok;
+    } catch {
+      return false;
+    }
+  }
+
   connect() {
     if (this.running) return;
     this.running = true;
@@ -349,7 +367,7 @@ export class ESP32Client {
         const body = await resp.json();
         if (body && typeof body.type === "string" && body.type !== "idle") {
           const t = body.type as ButtonEventType;
-          if (t === "sos" || t === "call1" || t === "call2" || t === "ack") {
+          if (t === "sos" || t === "call1" || t === "call2" || t === "ack" || t === "led") {
             const evt: SosEvent = {
               type: t,
               time: typeof body.time === "number" ? body.time : Date.now(),

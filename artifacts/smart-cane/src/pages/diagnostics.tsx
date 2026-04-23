@@ -9,7 +9,7 @@ import { geolocationAvailable, getLocationOnce, googleMapsLink } from "@/lib/geo
 import { smsCapability, placeCall } from "@/lib/sms";
 import { getGuardianPhone } from "@/lib/settings";
 import { useToast } from "@/hooks/use-toast";
-import { ShieldAlert, Volume2, VolumeX, Phone, Hand } from "lucide-react";
+import { ShieldAlert, Volume2, VolumeX, Phone, Hand, Flashlight } from "lucide-react";
 import { ESP32Client, type SosEvent } from "@/lib/esp32";
 
 // Diagnostics is also where the SOS hold-button and the audio mute
@@ -126,6 +126,7 @@ export default function DiagnosticsPage() {
       case "ack":   return "Single tap (ack / cancel)";
       case "call1": return "Speed-dial Person 1";
       case "call2": return "Speed-dial Person 2";
+      case "led":   return "4-tap LED toggle";
     }
   };
 
@@ -195,6 +196,9 @@ export default function DiagnosticsPage() {
           </Button>
           <Button onClick={() => simulateSos("call2")} variant="secondary" data-testid="button-sim-call2">
             <Phone className="w-4 h-4 mr-2" /> Speed-dial 2
+          </Button>
+          <Button onClick={() => simulateSos("led")} variant="secondary" className="col-span-2" data-testid="button-sim-led">
+            <Flashlight className="w-4 h-4 mr-2" /> 4-tap LED toggle
           </Button>
         </div>
         <p className="text-[11px] text-muted-foreground">
@@ -302,7 +306,6 @@ export default function DiagnosticsPage() {
             {state === "connected" && client ? (
               <img
                 src={client.streamUrl}
-                crossOrigin="anonymous"
                 className="w-full h-full object-contain"
                 alt="Camera test stream"
                 onError={() => {
