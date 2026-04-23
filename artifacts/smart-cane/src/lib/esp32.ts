@@ -64,6 +64,7 @@ export class ESP32Client {
   private sosTimer:    number | null = null;
   private running = false;
   private failCount = 0;
+  private lastSensorOkAt = 0;
 
   constructor(host: string) {
     this.host = host.replace(/^https?:\/\//, "").replace(/\/$/, "");
@@ -84,6 +85,18 @@ export class ESP32Client {
 
   get hostname(): string {
     return this.host;
+  }
+
+  // Time-since-last-good /sensors poll, in ms. null if we've never had
+  // a successful poll yet. Surfaced in the home page's connection-health
+  // pill so you can spot the ESP32 falling behind during inference.
+  get lastSensorAgeMs(): number | null {
+    if (this.lastSensorOkAt === 0) return null;
+    return Date.now() - this.lastSensorOkAt;
+  }
+
+  get currentFailCount(): number {
+    return this.failCount;
   }
 
   // POST /vibrate?on=1|0 — tells the Nano (via ESP32 UART) to drive the
@@ -165,6 +178,7 @@ export class ESP32Client {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const body = await resp.json();
       this.failCount = 0;
+      this.lastSensorOkAt = Date.now();
       this.setState("connected");
 
       if (body && body.data && typeof body.data === "object") {

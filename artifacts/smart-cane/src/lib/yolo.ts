@@ -107,6 +107,12 @@ function preprocess(
     (source as HTMLImageElement).naturalHeight ||
     (source as HTMLCanvasElement).height;
 
+  if (srcW <= 0 || srcH <= 0) {
+    // MJPEG <img> hasn't decoded its first frame yet, or the camera
+    // dropped off mid-stream. Throwing here lets the caller skip this
+    // tick instead of crashing in tensor4d() with NaN dimensions.
+    throw new Error("source not ready (zero dimensions)");
+  }
   const scale = Math.min(INPUT_SIZE / srcW, INPUT_SIZE / srcH);
   const newW = Math.round(srcW * scale);
   const newH = Math.round(srcH * scale);

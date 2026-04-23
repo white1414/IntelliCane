@@ -155,41 +155,74 @@ export default function Home() {
     <div className="flex flex-col h-full">
       <canvas ref={scratchCanvasRef} className="hidden" />
       
-      {/* Viewport */}
+      {/* Viewport.
+          The MJPEG <img> stays mounted as long as we have a client — even
+          if `state` momentarily flips to "error" — because unmounting it
+          tears down the long-lived MJPEG socket. That socket is what
+          actually feeds the live preview, so dropping it on every
+          transient blip is what made the preview die a few seconds after
+          you hit Start Detection. We just dim the viewport and overlay a
+          status pill instead. */}
       <div className="relative w-full aspect-[4/3] bg-card flex-shrink-0 flex flex-col items-center justify-center border-b border-border overflow-hidden">
-        {state === "connected" && client ? (
+        {client ? (
           <>
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img 
+            <img
               ref={imgRef}
-              src={client.streamUrl} 
+              src={client.streamUrl}
               crossOrigin="anonymous"
-              className="absolute inset-0 w-full h-full object-contain"
+              className={`absolute inset-0 w-full h-full object-contain transition-opacity ${state === "connected" ? "opacity-100" : "opacity-50"}`}
               alt="Live feed from smart cane"
             />
-            <canvas 
-              ref={drawCanvasRef} 
+            <canvas
+              ref={drawCanvasRef}
               className="absolute inset-0 w-full h-full object-contain pointer-events-none"
             />
-            
-            {/* Perf overlay */}
+
+            {/* Health pill — top-right. Always visible so you can see
+                ESP32 link state at a glance, especially while the model
+                is running and pegging the CPU. */}
+            <div className="absolute top-2 right-2 bg-black/70 backdrop-blur text-white text-[10px] px-2 py-1 rounded-md font-mono flex items-center gap-2 pointer-events-none">
+              <span className={`inline-block w-2 h-2 rounded-full ${
+                state === "connected" ? "bg-green-400" :
+                state === "connecting" ? "bg-yellow-400 animate-pulse" :
+                "bg-red-400"
+              }`} />
+              <span>{state}</span>
+              {client.lastSensorAgeMs !== null && (
+                <span className="opacity-70">{Math.round(client.lastSensorAgeMs / 100) / 10}s ago</span>
+              )}
+            </div>
+
+            {/* Perf overlay — top-left, only while detecting. */}
             {isRunning && (
               <div className="absolute top-2 left-2 bg-black/60 backdrop-blur text-white text-xs px-2 py-1 rounded-md font-mono flex flex-col">
                 <span>{infTime}ms</span>
                 <span>{fps} FPS</span>
               </div>
             )}
+
+            {/* Status overlay shown only when we're not "connected". */}
+            {state !== "connected" && (
+              <div className="absolute inset-0 bg-black/50 flex flex-col items-center justify-center text-center p-6 text-white">
+                {state === "connecting" ? (
+                  <Loader2 className="w-10 h-10 animate-spin mb-3 text-primary" />
+                ) : (
+                  <WifiOff className="w-10 h-10 mb-3" />
+                )}
+                <h2 className="text-lg font-semibold mb-1">
+                  {state === "connecting" ? "Connecting…" : "Reconnecting…"}
+                </h2>
+                <p className="text-xs max-w-xs opacity-80">
+                  Lost contact with the cane. The live feed will resume automatically once /sensors responds.
+                </p>
+              </div>
+            )}
           </>
         ) : (
           <div className="text-center p-6 flex flex-col items-center text-muted-foreground">
-            {state === "connecting" ? (
-              <Loader2 className="w-10 h-10 animate-spin mb-4 text-primary" />
-            ) : (
-              <WifiOff className="w-10 h-10 mb-4" />
-            )}
-            <h2 className="text-xl font-semibold mb-2 text-foreground">
-              {state === "connecting" ? "Connecting..." : "Camera Disconnected"}
-            </h2>
+            <WifiOff className="w-10 h-10 mb-4" />
+            <h2 className="text-xl font-semibold mb-2 text-foreground">Camera Disconnected</h2>
             <p className="text-sm max-w-xs">
               Make sure your phone is connected to the "IntelliCane" WiFi network.
             </p>
