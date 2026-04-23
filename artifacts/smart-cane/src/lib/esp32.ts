@@ -2,14 +2,21 @@
  * IntelliCane ESP32-CAM client.
  *
  * The ESP32 firmware (see attached_assets/IntelliCane) exposes:
- *   GET /            — MJPEG stream (rendered as <img src=...>)
- *   GET /frame.jpg   — single JPEG snapshot
+ *   GET /            — MJPEG stream on port 81 (rendered as <img src=...>)
+ *   GET /frame.jpg   — single JPEG snapshot on port 80
  *   GET /sensors     — JSON with the latest Nano reading
  *   GET /sos         — JSON; returns the SOS press once then clears
+ *   POST /vibrate    — tells Nano to start/stop continuous vibrate
+ *   GET /health      — JSON liveness probe
  *
  * There is no WebSocket on the device, so this client polls /sensors at
- * ~10 Hz and /sos at ~1 Hz. The "connected" state means the last /sensors
+ * ~4 Hz and /sos at ~1.4 Hz. The "connected" state means the last /sensors
  * poll succeeded (HTTP 200 + parseable JSON).
+ *
+ * IMPORTANT: The ESP32 runs TWO httpd instances (port 80 = control, port 81
+ * = stream) with separate socket pools. If the stream server on :81 fails to
+ * start (socket exhaustion), the client falls back to polling /frame.jpg on
+ * port 80 as a snapshot source.
  */
 
 // Sensor head layout (see Nano firmware comment block):
@@ -77,13 +84,23 @@ export class ESP32Client {
   private lastHealthOkAt = 0;
   private lastFrameAt    = 0;
   private lastHealth: { uptimeMs: number; freeHeap: number; version: string } | null = null;
+  // If the MJPEG stream on :81 fails (server didn't start, socket
+  // exhaustion, etc.), we fall back to polling /frame.jpg on :80.
+  private streamFallback = false;
+  private streamErrorCount = 0;
+  private static readonly STREAM_ERROR_THRESHOLD = 3;
 
   constructor(host: string) {
     this.host = host.replace(/^https?:\/\//, "").replace(/\/$/, "");
   }
 
   get streamUrl(): string {
-    // MJPEG now lives on its own httpd instance at :81 so polling
+    if (this.streamFallback) {
+      // Fallback: use /frame.jpg on port 80 with a cache-buster.
+      // The <img> will poll this as a snapshot, not an MJPEG stream.
+      return `http://${this.host}/frame.jpg?t=${Date.now()}`;
+    }
+    // MJPEG lives on its own httpd instance at :81 so polling
     // /sensors and /sos on :80 cannot evict the long-lived stream
     // socket (see ESP32-CAM firmware comment block in start_webserver).
     return `http://${this.host}:81/`;
@@ -91,6 +108,29 @@ export class ESP32Client {
 
   get snapshotUrl(): string {
     return `http://${this.host}/frame.jpg?t=${Date.now()}`;
+  }
+
+  // Returns true if we've given up on the :81 MJPEG stream and are
+  // using /frame.jpg polling instead. The UI can use this to show a
+  // "low-fps mode" indicator.
+  get isStreamFallback(): boolean {
+    return this.streamFallback;
+  }
+
+  // Call this from the <img onError> handler to track stream failures.
+  // After STREAM_ERROR_THRESHOLD consecutive failures, we switch to
+  // /frame.jpg fallback mode.
+  reportStreamError() {
+    this.streamErrorCount++;
+    if (!this.streamFallback && this.streamErrorCount >= ESP32Client.STREAM_ERROR_THRESHOLD) {
+      this.streamFallback = true;
+      console.warn(`[ESP32Client] MJPEG stream on :81 failed ${this.streamErrorCount} times, switching to /frame.jpg fallback`);
+    }
+  }
+
+  // Call this from the <img onLoad> handler to reset the error counter.
+  reportStreamOk() {
+    this.streamErrorCount = 0;
   }
 
   get connectionState(): ConnState {
@@ -133,6 +173,7 @@ export class ESP32Client {
   // frames vs. just sitting there with the headers received.
   markFrameReceived() {
     this.lastFrameAt = Date.now();
+    this.reportStreamOk();
   }
 
   get lastFrameAgeMs(): number | null {
@@ -142,16 +183,23 @@ export class ESP32Client {
 
   // POST /vibrate?on=1|0 — tells the Nano (via ESP32 UART) to drive the
   // vibration motor non-stop, used during a suspected-fall countdown.
+  // We send an empty body with Content-Length: 0 so the ESP32 httpd
+  // doesn't have to drain anything. The query string carries the param.
   async setVibrate(on: boolean): Promise<boolean> {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 1500);
+      const tid = window.setTimeout(() => ctrl.abort(), 2000);
       const resp = await fetch(`http://${this.host}/vibrate?on=${on ? 1 : 0}`, {
         method: "POST",
         cache: "no-store",
         signal: ctrl.signal,
+        headers: {
+          "Content-Length": "0",
+        },
       });
       window.clearTimeout(tid);
+      // Drain the response body so the connection can be reused.
+      await resp.text();
       return resp.ok;
     } catch {
       return false;
@@ -218,10 +266,11 @@ export class ESP32Client {
   private async pollHealth() {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 1500);
+      const tid = window.setTimeout(() => ctrl.abort(), 2000);
       const resp = await fetch(`http://${this.host}/health`, {
         cache: "no-store",
         signal: ctrl.signal,
+        mode: "cors",
       });
       window.clearTimeout(tid);
       if (resp.ok) {
@@ -245,10 +294,11 @@ export class ESP32Client {
   private async pollSensors() {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 1500);
+      const tid = window.setTimeout(() => ctrl.abort(), 2000);
       const resp = await fetch(`http://${this.host}/sensors`, {
         cache: "no-store",
         signal: ctrl.signal,
+        mode: "cors",
       });
       window.clearTimeout(tid);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -288,10 +338,11 @@ export class ESP32Client {
   private async pollSos() {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 1500);
+      const tid = window.setTimeout(() => ctrl.abort(), 2000);
       const resp = await fetch(`http://${this.host}/sos`, {
         cache: "no-store",
         signal: ctrl.signal,
+        mode: "cors",
       });
       window.clearTimeout(tid);
       if (resp.ok) {

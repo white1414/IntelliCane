@@ -10,7 +10,7 @@ import { smsCapability, placeCall } from "@/lib/sms";
 import { getGuardianPhone } from "@/lib/settings";
 import { useToast } from "@/hooks/use-toast";
 import { ShieldAlert, Volume2, VolumeX, Phone, Hand } from "lucide-react";
-import type { SosEvent } from "@/lib/esp32";
+import { ESP32Client, type SosEvent } from "@/lib/esp32";
 
 // Diagnostics is also where the SOS hold-button and the audio mute
 // toggle now live (they used to be in the global header). The Active
@@ -286,10 +286,28 @@ export default function DiagnosticsPage() {
         </div>
 
         <div className="space-y-2">
-          <span className="text-sm block">MJPEG stream</span>
+          <span className="text-sm block">
+            MJPEG stream
+            {client && (client as ESP32Client).isStreamFallback && (
+              <span className="text-yellow-500 text-xs ml-2">(snapshot mode)</span>
+            )}
+          </span>
           <div className="w-full aspect-video bg-black rounded-lg overflow-hidden flex items-center justify-center border border-border">
             {state === "connected" && client ? (
-              <img src={client.streamUrl} crossOrigin="anonymous" className="w-full h-full object-contain" alt="Camera test stream" />
+              <img
+                src={client.streamUrl}
+                crossOrigin="anonymous"
+                className="w-full h-full object-contain"
+                alt="Camera test stream"
+                onError={() => {
+                  (client as ESP32Client).reportStreamError();
+                  // Retry with fresh URL after backoff
+                  const img = document.querySelector('[alt="Camera test stream"]') as HTMLImageElement | null;
+                  if (img && client) {
+                    setTimeout(() => { img.src = client.streamUrl; }, 1500);
+                  }
+                }}
+              />
             ) : (
               <span className="text-muted-foreground text-xs font-mono">No stream</span>
             )}

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ESP32Client } from "@/lib/esp32";
+import { ESP32Client } from "@/lib/esp32";
 import { useSmartCane } from "@/hooks/use-smart-cane";
 import { loadModel, detect, Detection, isModelLoaded } from "@/lib/yolo";
 import { getConfThreshold, getTargetFps } from "@/lib/settings";
@@ -196,13 +196,16 @@ export default function Home() {
                 setFrameCount(c => c + 1);
               }}
               onError={() => {
-                // Stream socket died (server went down, port blocked,
-                // mixed-content, etc). Force the <img> to retry by
-                // pushing a fresh URL on the next render — but only
-                // after a short backoff so we don't spin.
+                // Report the stream error to the client so it can
+                // track consecutive failures and switch to /frame.jpg
+                // fallback if :81 is unreachable.
+                (client as ESP32Client).reportStreamError();
+                // Force the <img> to retry by pushing a fresh URL —
+                // the client.streamUrl getter returns a different URL
+                // depending on whether we're in fallback mode.
                 window.setTimeout(() => {
                   if (imgRef.current && client) {
-                    imgRef.current.src = `${client.streamUrl}?r=${Date.now()}`;
+                    imgRef.current.src = client.streamUrl;
                   }
                 }, 1500);
               }}
@@ -238,6 +241,11 @@ export default function Home() {
               <span className="opacity-60 border-l border-white/20 pl-2">
                 {frameCount}f
               </span>
+              {(client as ESP32Client).isStreamFallback && (
+                <span className="opacity-60 border-l border-white/20 pl-2 text-yellow-300">
+                  SNAP
+                </span>
+              )}
             </div>
 
             {/* Perf overlay — top-left, only while detecting. */}

@@ -100,9 +100,9 @@ static const char *TAG = "intellicane";
 
 /* ---------------- MJPEG / camera ---------------- */
 #define MJPEG_BOUNDARY      "frame"
-#define CAMERA_FRAME_SIZE   FRAMESIZE_VGA
-#define CAMERA_JPEG_QUALITY 10
-#define CAMERA_FB_COUNT     2
+#define CAMERA_FRAME_SIZE   FRAMESIZE_QVGA
+#define CAMERA_JPEG_QUALITY 12
+#define CAMERA_FB_COUNT     1
 
 /* ---------------- Globals ---------------- */
 // Latest pending button event, consumed by /sos handler.
@@ -207,27 +207,57 @@ static void wifi_init_ap(void) {
 }
 
 /* ---------------- MJPEG stream handler ---------------- */
+//
+// Serves a multipart/x-mixed-replace MJPEG stream. This handler runs on
+// the DEDICATED stream httpd on port 81 so it cannot be evicted by short-
+// lived control polls on port 80.
+//
+// Key resilience improvements over the original:
+//   - On send failure we do NOT immediately break — we return the frame
+//     buffer and back off 100 ms before retrying. This prevents a single
+//     dropped chunk from killing the entire stream socket.
+//   - We cap the loop at 3 consecutive send failures before giving up,
+//     so we don't spin forever if the client truly disconnected.
+//   - Frame rate is limited to ~10 fps (100 ms between sends) to reduce
+//     CPU and memory pressure on the ESP32-CAM.
 static esp_err_t stream_handler(httpd_req_t *req) {
     char part_buf[128];
+    int consecutive_failures = 0;
+
     httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=" MJPEG_BOUNDARY);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
 
-    while (true) {
+    while (consecutive_failures < 3) {
         camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        if (!fb) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
 
         int hlen = snprintf(part_buf, sizeof(part_buf),
             "\r\n--" MJPEG_BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
             (unsigned int)fb->len);
-        if (httpd_resp_send_chunk(req, part_buf, hlen) != ESP_OK) {
-            esp_camera_fb_return(fb); break;
-        }
-        if (httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len) != ESP_OK) {
-            esp_camera_fb_return(fb); break;
+
+        esp_err_t r1 = httpd_resp_send_chunk(req, part_buf, hlen);
+        esp_err_t r2 = ESP_OK;
+        if (r1 == ESP_OK) {
+            r2 = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
         }
         esp_camera_fb_return(fb);
-        vTaskDelay(pdMS_TO_TICKS(50));
+
+        if (r1 != ESP_OK || r2 != ESP_OK) {
+            consecutive_failures++;
+            ESP_LOGW(TAG, "Stream send chunk failed (%d/3), backing off", consecutive_failures);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        consecutive_failures = 0;
+        vTaskDelay(pdMS_TO_TICKS(100));  // ~10 fps
     }
+
+    ESP_LOGI(TAG, "Stream handler exiting (client likely disconnected)");
     return ESP_OK;
 }
 
@@ -237,6 +267,7 @@ static esp_err_t frame_handler(httpd_req_t *req) {
     if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
     esp_camera_fb_return(fb);
     return res;
@@ -257,6 +288,7 @@ static esp_err_t sos_handler(httpd_req_t *req) {
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
     const char *type_str = "idle";
     switch (ev) {
@@ -295,6 +327,7 @@ static esp_err_t sensors_handler(httpd_req_t *req) {
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     if (!have_data) {
         const char *msg = "{\"status\":\"idle\"}";
         return httpd_resp_send(req, msg, strlen(msg));
@@ -309,7 +342,25 @@ static esp_err_t sensors_handler(httpd_req_t *req) {
 //
 // Accepts ?on=1 / ?on=0 in the query string. We could also accept a JSON
 // body but query-string keeps the phone code trivial.
+//
+// CRITICAL: ESP-IDF's httpd requires the handler to consume (drain) the
+// entire request body before sending a response. If the client sends a
+// POST body (even an empty one with Content-Length: 0), any unconsumed
+// bytes corrupt the next request on that same socket. The old code never
+// drained the body, which caused the NEXT request after a /vibrate POST
+// to fail with a parse error — and since /sos and /sensors polls happen
+// every 250-700 ms, this was silently killing control connections.
 static esp_err_t vibrate_handler(httpd_req_t *req) {
+    // DRAIN the request body first, no matter what it contains.
+    int remaining = req->content_len;
+    char drain_buf[64];
+    while (remaining > 0) {
+        int to_read = remaining > (int)sizeof(drain_buf) ? (int)sizeof(drain_buf) : remaining;
+        int got = httpd_req_recv(req, drain_buf, to_read);
+        if (got <= 0) break;  // error or connection closed
+        remaining -= got;
+    }
+
     char query[32];
     char val[8] = {0};
     bool on = false;
@@ -322,11 +373,11 @@ static esp_err_t vibrate_handler(httpd_req_t *req) {
 
     char cmd = on ? 'V' : 'S';
     uart_write_bytes(NANO_UART_NUM, &cmd, 1);
-    // newline so the Nano's loop sees it promptly even if it ever buffered
     uart_write_bytes(NANO_UART_NUM, "\n", 1);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     char resp[48];
     int len = snprintf(resp, sizeof(resp), "{\"vibrate\":%s}", on ? "true" : "false");
     return httpd_resp_send(req, resp, len);
@@ -352,12 +403,16 @@ static esp_err_t health_handler(httpd_req_t *req) {
     return httpd_resp_send(req, resp, len);
 }
 
-// CORS preflight for /vibrate (browsers will send OPTIONS first for POST
-// from a different origin). Any URI matches; we only register OPTIONS.
+// CORS preflight handler — browsers send OPTIONS before any cross-origin
+// request (not just POST /vibrate). We register this as a wildcard URI
+// matcher so ALL endpoints respond correctly to preflight checks.
+// Without this, the Capacitor WebView on Android may silently drop
+// cross-origin fetches to /sos, /sensors, /health, etc.
 static esp_err_t options_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, Authorization, X-Client-Info, Apikey");
+    httpd_resp_set_hdr(req, "Access-Control-Max-Age", "86400");  // 24h cache
     httpd_resp_set_status(req, "204 No Content");
     return httpd_resp_send(req, NULL, 0);
 }
@@ -401,17 +456,24 @@ static httpd_handle_t start_control_server(void) {
     config.server_port      = 80;
     config.ctrl_port        = 32768;        // must differ from stream server
     config.stack_size       = 8192;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
     // Control endpoints are short-lived. Aggressively purge dead sockets
     // so a flaky Capacitor WebView can't squat on slots for a minute.
     //
-    // NOTE on socket budget: ESP-IDF's LWIP defaults to LWIP_MAX_SOCKETS=10.
-    // The SoftAP stack itself burns ~2 sockets (DHCP + DNS), so we have ~8
-    // to share between the control and stream httpd instances. Keep the
-    // sums conservative or the second httpd_start() will silently fail
-    // with ESP_ERR_HTTPD_ALLOC_MEM and you'll get a black stream forever.
+    // SOCKET BUDGET (the root cause of the black-stream bug):
+    //   LWIP_MAX_SOCKETS defaults to 10.
+    //   SoftAP burns ~2 (DHCP + DNS) → 8 usable.
+    //   OLD config: control=4 + stream=3 = 7 → only 1 free socket.
+    //   When the Capacitor WebView opens extra connections (pre-fetch,
+    //   favicon, duplicate fetch), that 1 socket fills instantly, LRU
+    //   purge kills the oldest socket = the MJPEG stream → black screen.
+    //   And then /sos and /vibrate polls also fail because no sockets.
+    //
+    //   NEW config: control=3 + stream=2 = 5 → 3 free sockets as buffer.
+    //   This gives enough headroom for transient connections without
+    //   evicting the long-lived stream socket.
     config.lru_purge_enable  = true;
-    config.max_open_sockets  = 4;
+    config.max_open_sockets  = 3;
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
     config.keep_alive_enable = false;
@@ -422,18 +484,35 @@ static httpd_handle_t start_control_server(void) {
         return NULL;
     }
 
+    // Register all control endpoints.
     httpd_uri_t frame_uri    = { .uri="/frame.jpg", .method=HTTP_GET,    .handler=frame_handler };
     httpd_uri_t sos_uri      = { .uri="/sos",       .method=HTTP_GET,    .handler=sos_handler };
     httpd_uri_t sensors_uri  = { .uri="/sensors",   .method=HTTP_GET,    .handler=sensors_handler };
     httpd_uri_t vibrate_uri  = { .uri="/vibrate",   .method=HTTP_POST,   .handler=vibrate_handler };
-    httpd_uri_t vibrate_opts = { .uri="/vibrate",   .method=HTTP_OPTIONS,.handler=options_handler };
     httpd_uri_t health_uri   = { .uri="/health",    .method=HTTP_GET,    .handler=health_handler };
+
+    // CORS preflight — register for EVERY endpoint path. Browsers send
+    // OPTIONS before any cross-origin request, not just POST. If we only
+    // register OPTIONS on /vibrate, the WebView may silently drop
+    // fetches to /sos, /sensors, /health because the preflight returns
+    // 404 (no matching handler) and the actual request never goes out.
+    httpd_uri_t opts_frame   = { .uri="/frame.jpg", .method=HTTP_OPTIONS, .handler=options_handler };
+    httpd_uri_t opts_sos     = { .uri="/sos",       .method=HTTP_OPTIONS, .handler=options_handler };
+    httpd_uri_t opts_sensors = { .uri="/sensors",   .method=HTTP_OPTIONS, .handler=options_handler };
+    httpd_uri_t opts_vibrate = { .uri="/vibrate",   .method=HTTP_OPTIONS, .handler=options_handler };
+    httpd_uri_t opts_health  = { .uri="/health",     .method=HTTP_OPTIONS, .handler=options_handler };
+
     httpd_register_uri_handler(server, &frame_uri);
     httpd_register_uri_handler(server, &sos_uri);
     httpd_register_uri_handler(server, &sensors_uri);
     httpd_register_uri_handler(server, &vibrate_uri);
-    httpd_register_uri_handler(server, &vibrate_opts);
     httpd_register_uri_handler(server, &health_uri);
+    httpd_register_uri_handler(server, &opts_frame);
+    httpd_register_uri_handler(server, &opts_sos);
+    httpd_register_uri_handler(server, &opts_sensors);
+    httpd_register_uri_handler(server, &opts_vibrate);
+    httpd_register_uri_handler(server, &opts_health);
+
     ESP_LOGI(TAG, "Control HTTP server up on :80 (free heap %u)",
              (unsigned)esp_get_free_heap_size());
     return server;
@@ -444,14 +523,13 @@ static httpd_handle_t start_stream_server(void) {
     config.server_port      = 81;
     config.ctrl_port        = 32769;        // must differ from control server
     config.stack_size       = 8192;
-    config.max_uri_handlers = 2;
-    // Stream pool only ever needs one or two sockets — but give it room
-    // so a tab refresh doesn't immediately strangle the new connection.
-    // Stream pool only ever needs one socket per viewer. Keep this tight
-    // so we leave headroom for the control server + the SoftAP's own
-    // DHCP/DNS sockets. (See note in start_control_server.)
+    config.max_uri_handlers = 4;
+    // Stream pool: 2 sockets max. One for the active MJPEG stream, one
+    // spare for a tab refresh. Keeping this tight leaves headroom for
+    // the control server + SoftAP's DHCP/DNS sockets.
+    // (See socket budget note in start_control_server.)
     config.lru_purge_enable  = true;
-    config.max_open_sockets  = 3;
+    config.max_open_sockets  = 2;
     // Long timeouts: the stream send loop legitimately blocks for tens of
     // ms while the camera produces the next JPEG; we don't want LWIP
     // declaring it dead.
@@ -471,17 +549,31 @@ static httpd_handle_t start_stream_server(void) {
         return NULL;
     }
     httpd_uri_t stream_uri = { .uri="/", .method=HTTP_GET, .handler=stream_handler };
+    httpd_uri_t opts_stream = { .uri="/", .method=HTTP_OPTIONS, .handler=options_handler };
     httpd_register_uri_handler(server, &stream_uri);
+    httpd_register_uri_handler(server, &opts_stream);
     ESP_LOGI(TAG, "Stream HTTP server up on :81 (free heap %u)",
              (unsigned)esp_get_free_heap_size());
     return server;
 }
 
 // Compatibility wrapper — keeps app_main's original call site working.
+// We no longer return NULL if the stream server fails — the control
+// server on :80 is enough for /sos, /sensors, /vibrate, /health, and
+// /frame.jpg. The phone app can fall back to /frame.jpg polling if
+// the MJPEG stream on :81 is unavailable.
 static httpd_handle_t start_webserver(void) {
     s_ctrl_server   = start_control_server();
     s_stream_server = start_stream_server();
-    return (s_ctrl_server && s_stream_server) ? s_ctrl_server : NULL;
+    if (!s_ctrl_server) {
+        ESP_LOGE(TAG, "Control server failed — cannot continue");
+        return NULL;
+    }
+    if (!s_stream_server) {
+        ESP_LOGW(TAG, "Stream server on :81 not available — "
+                      "phone will use /frame.jpg fallback");
+    }
+    return s_ctrl_server;
 }
 
 /* ---------------- SOS button: hold + multi-click detector ---------------- */
@@ -652,9 +744,10 @@ void app_main(void) {
 
     ESP_LOGI(TAG,
         "IntelliCane ready.\n"
-        "  Stream:   http://192.168.4.1:81/\n"
+        "  Stream:   http://192.168.4.1:81/  (fallback: /frame.jpg on :80)\n"
         "  Snapshot: http://192.168.4.1/frame.jpg\n"
         "  Sensors:  http://192.168.4.1/sensors\n"
         "  SOS poll: http://192.168.4.1/sos\n"
-        "  Vibrate:  POST http://192.168.4.1/vibrate?on=1");
+        "  Vibrate:  POST http://192.168.4.1/vibrate?on=1\n"
+        "  Health:   http://192.168.4.1/health");
 }
