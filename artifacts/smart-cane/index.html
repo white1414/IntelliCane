@@ -10,6 +10,16 @@
     <meta name="mobile-web-app-capable" content="yes" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <title>IntelliCane</title>
+    <!--
+      Load the tfjs-tflite runtime via a classic <script> from /tflite-wasm/.
+      This MUST come before the module bundle so window.tflite is defined by
+      the time yolo.ts touches it. We deliberately do NOT import
+      "@tensorflow/tfjs-tflite" as an ES module anywhere — bundlers bake the
+      original node_modules URL into the build, which breaks inside the
+      Capacitor APK (no node_modules at runtime → SPA fallback → MIME error
+      → white screen). The script tag avoids that entirely.
+    -->
+    <script src="./tflite-wasm/tflite_web_api_client.js"></script>
   </head>
   <body>
     <div id="root"></div>

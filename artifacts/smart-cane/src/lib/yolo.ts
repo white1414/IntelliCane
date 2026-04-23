@@ -1,8 +1,32 @@
 import * as tf from "@tensorflow/tfjs-core";
 import "@tensorflow/tfjs-backend-cpu";
 import { setWasmPaths } from "@tensorflow/tfjs-backend-wasm";
-import * as tflite from "@tensorflow/tfjs-tflite";
+// IMPORTANT: do NOT `import * as tflite from "@tensorflow/tfjs-tflite"` here.
+// The package is loaded at runtime via a classic <script> tag in index.html
+// (see public/tflite-wasm/tflite_web_api_client.js) and exposed as the
+// global `window.tflite`. Bundling it through Vite/Rollup bakes the
+// original node_modules URL into the production output, which 404s inside
+// the Capacitor APK and causes the WebView to render a white screen.
+//
+// We import the package only for its TypeScript types (no emitted import).
+import type * as TFLiteNS from "@tensorflow/tfjs-tflite";
 import { CLASS_NAMES } from "./labels";
+
+declare global {
+  interface Window {
+    tflite?: typeof TFLiteNS;
+  }
+}
+
+function getTflite(): typeof TFLiteNS {
+  const t = window.tflite;
+  if (!t) {
+    throw new Error(
+      "tfjs-tflite runtime not loaded. Make sure <script src=\"./tflite-wasm/tflite_web_api_client.js\"></script> is present in index.html and that the file exists in public/tflite-wasm/.",
+    );
+  }
+  return t;
+}
 
 const INPUT_SIZE = 640;
 const NUM_CLASSES = CLASS_NAMES.length;
@@ -18,12 +42,14 @@ export interface Detection {
   h: number;
 }
 
-let model: tflite.TFLiteModel | null = null;
-let loading: Promise<tflite.TFLiteModel> | null = null;
+let model: TFLiteNS.TFLiteModel | null = null;
+let loading: Promise<TFLiteNS.TFLiteModel> | null = null;
 
-export async function loadModel(modelUrl: string): Promise<tflite.TFLiteModel> {
+export async function loadModel(modelUrl: string): Promise<TFLiteNS.TFLiteModel> {
   if (model) return model;
   if (loading) return loading;
+
+  const tflite = getTflite();
 
   // Serve WASM from the bundled /tflite-wasm folder so it works on the
   // ESP32-CAM SoftAP (no internet) once the APK is installed.

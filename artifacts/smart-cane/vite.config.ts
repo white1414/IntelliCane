@@ -39,20 +39,14 @@ export default defineConfig({
     },
     dedupe: ["react", "react-dom"],
   },
-  optimizeDeps: {
-    exclude: ["@tensorflow/tfjs-tflite"],
-  },
+  // tfjs-tflite is loaded via a <script> tag in index.html and consumed as
+  // window.tflite — see src/lib/yolo.ts. We deliberately do NOT bundle it.
+  // The previous optimizeDeps.exclude + rollupOptions.external trick was
+  // baking the absolute node_modules URL into the production bundle, which
+  // 404s inside the Capacitor APK and causes a white screen.
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
-    rollupOptions: {
-      external: [/tflite_web_api_client$/],
-      output: {
-        paths: {
-          "./tflite_web_api_client": "/tflite-wasm/tflite_web_api_client.js",
-        },
-      },
-    },
   },
   root: path.resolve(import.meta.dirname),
   server: {
