@@ -28,7 +28,7 @@ export default function Home() {
   useEffect(() => {
     if (!isModelLoaded()) {
       setModelLoading(true);
-      const url = import.meta.env.BASE_URL.replace(/\/$/, "") + "/yolo.onnx";
+      const url = import.meta.env.BASE_URL.replace(/\/$/, "") + "/yolo.tflite";
       loadModel(url).then(() => {
         setModelReady(true);
         setModelLoading(false);

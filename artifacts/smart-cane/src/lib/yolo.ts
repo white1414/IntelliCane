@@ -1,4 +1,7 @@
-import * as ort from "onnxruntime-web";
+import * as tf from "@tensorflow/tfjs-core";
+import "@tensorflow/tfjs-backend-cpu";
+import { setWasmPaths } from "@tensorflow/tfjs-backend-wasm";
+import * as tflite from "@tensorflow/tfjs-tflite";
 import { CLASS_NAMES } from "./labels";
 
 const INPUT_SIZE = 640;
@@ -15,37 +18,38 @@ export interface Detection {
   h: number;
 }
 
-let session: ort.InferenceSession | null = null;
-let loading: Promise<ort.InferenceSession> | null = null;
+let model: tflite.TFLiteModel | null = null;
+let loading: Promise<tflite.TFLiteModel> | null = null;
 
-export async function loadModel(modelUrl: string): Promise<ort.InferenceSession> {
-  if (session) return session;
+export async function loadModel(modelUrl: string): Promise<tflite.TFLiteModel> {
+  if (model) return model;
   if (loading) return loading;
 
-  ort.env.wasm.wasmPaths =
-    "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
-  ort.env.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
-  ort.env.wasm.simd = true;
+  // Serve WASM from the bundled /tflite-wasm folder so it works on the
+  // ESP32-CAM SoftAP (no internet) once the APK is installed.
+  const base = import.meta.env.BASE_URL.replace(/\/$/, "") + "/tflite-wasm/";
+  setWasmPaths(base);
+  tflite.setWasmPath(base);
+  await tf.ready();
 
-  loading = ort.InferenceSession.create(modelUrl, {
-    executionProviders: ["wasm"],
-    graphOptimizationLevel: "all",
-  }).then((s) => {
-    session = s;
-    return s;
-  });
+  loading = tflite
+    .loadTFLiteModel(modelUrl, { numThreads: Math.min(4, navigator.hardwareConcurrency || 2) })
+    .then((m) => {
+      model = m;
+      return m;
+    });
   return loading;
 }
 
 export function isModelLoaded(): boolean {
-  return session !== null;
+  return model !== null;
 }
 
-// Resize+letterbox the source frame into a 640x640 RGB Float32Array (CHW, 0..1).
+// Resize+letterbox the source frame into a 640x640 RGB Float32Array (HWC, 0..1).
 function preprocess(
   source: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
   scratchCanvas: HTMLCanvasElement,
-): { tensor: Float32Array; scale: number; padX: number; padY: number; srcW: number; srcH: number } {
+): { tensor: tf.Tensor; scale: number; padX: number; padY: number; srcW: number; srcH: number } {
   const srcW =
     (source as HTMLVideoElement).videoWidth ||
     (source as HTMLImageElement).naturalWidth ||
@@ -68,28 +72,26 @@ function preprocess(
   ctx.fillRect(0, 0, INPUT_SIZE, INPUT_SIZE);
   ctx.drawImage(source, padX, padY, newW, newH);
 
+  // Build [1, H, W, 3] float32 in 0..1 — matches the standard ultralytics
+  // TFLite export (NHWC). For INT8 models the runtime will quantize on entry.
   const imgData = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
-  const tensor = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
-  const channelSize = INPUT_SIZE * INPUT_SIZE;
-  for (let i = 0; i < channelSize; i++) {
-    tensor[i] = imgData[i * 4] / 255;
-    tensor[i + channelSize] = imgData[i * 4 + 1] / 255;
-    tensor[i + 2 * channelSize] = imgData[i * 4 + 2] / 255;
+  const data = new Float32Array(INPUT_SIZE * INPUT_SIZE * 3);
+  for (let i = 0, j = 0; i < imgData.length; i += 4, j += 3) {
+    data[j] = imgData[i] / 255;
+    data[j + 1] = imgData[i + 1] / 255;
+    data[j + 2] = imgData[i + 2] / 255;
   }
+  const tensor = tf.tensor4d(data, [1, INPUT_SIZE, INPUT_SIZE, 3], "float32");
   return { tensor, scale, padX, padY, srcW, srcH };
 }
 
 function iou(a: Detection, b: Detection): number {
-  const ax1 = a.x;
-  const ay1 = a.y;
   const ax2 = a.x + a.w;
   const ay2 = a.y + a.h;
-  const bx1 = b.x;
-  const by1 = b.y;
   const bx2 = b.x + b.w;
   const by2 = b.y + b.h;
-  const interX1 = Math.max(ax1, bx1);
-  const interY1 = Math.max(ay1, by1);
+  const interX1 = Math.max(a.x, b.x);
+  const interY1 = Math.max(a.y, b.y);
   const interX2 = Math.min(ax2, bx2);
   const interY2 = Math.min(ay2, by2);
   const interW = Math.max(0, interX2 - interX1);
@@ -120,7 +122,7 @@ export async function detect(
   scratchCanvas: HTMLCanvasElement,
   options?: { confThreshold?: number; iouThreshold?: number },
 ): Promise<Detection[]> {
-  if (!session) throw new Error("Model not loaded yet");
+  if (!model) throw new Error("Model not loaded yet");
   const confThreshold = options?.confThreshold ?? 0.4;
   const iouThreshold = options?.iouThreshold ?? 0.45;
 
@@ -128,29 +130,72 @@ export async function detect(
     source,
     scratchCanvas,
   );
-  const inputName = session.inputNames[0];
-  const outputName = session.outputNames[0];
-  const inputTensor = new ort.Tensor("float32", tensor, [
-    1,
-    3,
-    INPUT_SIZE,
-    INPUT_SIZE,
-  ]);
 
-  const results = await session.run({ [inputName]: inputTensor });
-  const output = results[outputName];
-  // Ultralytics YOLOv8 ONNX output: [1, 4 + nc, 8400]
-  const data = output.data as Float32Array;
-  const dims = output.dims;
-  const numAttrs = dims[1]; // 4 + nc
-  const numAnchors = dims[2]; // 8400
+  let outputs: tf.Tensor | tf.Tensor[] | { [n: string]: tf.Tensor };
+  try {
+    outputs = model.predict(tensor) as tf.Tensor | tf.Tensor[];
+  } finally {
+    tensor.dispose();
+  }
+
+  // Pull the first output tensor.
+  let out: tf.Tensor;
+  if (Array.isArray(outputs)) {
+    out = outputs[0];
+  } else if (outputs instanceof tf.Tensor) {
+    out = outputs;
+  } else {
+    out = Object.values(outputs)[0] as tf.Tensor;
+  }
+
+  // Ultralytics TFLite YOLOv8 output shape can be [1, 4+nc, 8400] OR
+  // [1, 8400, 4+nc] depending on export options. Detect by dim values.
+  const dims = out.shape;
+  const data = (await out.data()) as Float32Array;
+  out.dispose();
+  if (Array.isArray(outputs)) {
+    for (let i = 1; i < outputs.length; i++) (outputs as tf.Tensor[])[i].dispose();
+  }
+
+  const expectedAttrs = 4 + NUM_CLASSES;
+  let numAnchors: number;
+  let attrIsFastAxis: boolean; // true → [1, A, 4+nc]; false → [1, 4+nc, A]
+  if (dims[1] === expectedAttrs) {
+    numAnchors = dims[2]!;
+    attrIsFastAxis = false;
+  } else if (dims[2] === expectedAttrs) {
+    numAnchors = dims[1]!;
+    attrIsFastAxis = true;
+  } else {
+    throw new Error(
+      `Unexpected model output shape [${dims.join(",")}]; expected one dim to equal ${expectedAttrs}`,
+    );
+  }
+
+  const get = (anchor: number, attr: number): number =>
+    attrIsFastAxis
+      ? data[anchor * expectedAttrs + attr]
+      : data[attr * numAnchors + anchor];
+
+  // Some TFLite exports keep the model input range at 0..640, others at 0..1.
+  // Sniff once: if max coord is <=1.5 we assume normalized coords.
+  let coordsAreNormalized = false;
+  {
+    const cx0 = get(0, 0);
+    const cy0 = get(0, 1);
+    const w0 = get(0, 2);
+    const h0 = get(0, 3);
+    const m = Math.max(Math.abs(cx0), Math.abs(cy0), Math.abs(w0), Math.abs(h0));
+    coordsAreNormalized = m <= 1.5;
+  }
+  const coordScale = coordsAreNormalized ? INPUT_SIZE : 1;
 
   const detections: Detection[] = [];
   for (let i = 0; i < numAnchors; i++) {
     let bestClass = -1;
     let bestScore = 0;
     for (let c = 0; c < NUM_CLASSES; c++) {
-      const score = data[(4 + c) * numAnchors + i];
+      const score = get(i, 4 + c);
       if (score > bestScore) {
         bestScore = score;
         bestClass = c;
@@ -158,13 +203,11 @@ export async function detect(
     }
     if (bestScore < confThreshold) continue;
 
-    // YOLOv8 outputs xywh in input pixel space (0..640)
-    const cx = data[0 * numAnchors + i];
-    const cy = data[1 * numAnchors + i];
-    const w = data[2 * numAnchors + i];
-    const h = data[3 * numAnchors + i];
+    const cx = get(i, 0) * coordScale;
+    const cy = get(i, 1) * coordScale;
+    const w = get(i, 2) * coordScale;
+    const h = get(i, 3) * coordScale;
 
-    // Undo letterbox: subtract pad, divide by scale, then normalize
     const x = (cx - w / 2 - padX) / scale;
     const y = (cy - h / 2 - padY) / scale;
     const bw = w / scale;
@@ -172,7 +215,7 @@ export async function detect(
 
     detections.push({
       classId: bestClass,
-      className: CLASS_NAMES[bestClass],
+      className: CLASS_NAMES[bestClass] ?? `class_${bestClass}`,
       confidence: bestScore,
       x: Math.max(0, x / srcW),
       y: Math.max(0, y / srcH),

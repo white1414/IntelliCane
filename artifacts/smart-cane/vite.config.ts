@@ -39,11 +39,22 @@ export default defineConfig({
     },
     dedupe: ["react", "react-dom"],
   },
-  root: path.resolve(import.meta.dirname),
+  optimizeDeps: {
+    exclude: ["@tensorflow/tfjs-tflite"],
+  },
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
+    rollupOptions: {
+      external: [/tflite_web_api_client$/],
+      output: {
+        paths: {
+          "./tflite_web_api_client": "/tflite-wasm/tflite_web_api_client.js",
+        },
+      },
+    },
   },
+  root: path.resolve(import.meta.dirname),
   server: {
     port,
     strictPort: true,
