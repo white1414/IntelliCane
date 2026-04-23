@@ -13,6 +13,7 @@ export interface SendSmsResult {
 
 interface SmsPlugin {
   send(opts: { numbers: string[]; text: string }): Promise<unknown>;
+  placeCall?(opts: { number: string }): Promise<unknown>;
 }
 
 let cachedNative: SmsPlugin | null | undefined = undefined;
@@ -81,6 +82,48 @@ export async function sendSms(phone: string, body: string): Promise<SendSmsResul
       sent: false,
       openedComposer: false,
       error: e instanceof Error ? e.message : "Could not open SMS app.",
+    };
+  }
+}
+
+export interface PlaceCallResult {
+  placed: boolean;        // true when the native plugin actually started a call
+  openedDialer: boolean;  // true when we opened the tel: link as a fallback
+  error?: string;
+}
+
+export async function placeCall(phone: string): Promise<PlaceCallResult> {
+  const cleanedPhone = phone.replace(/[^\d+]/g, "");
+  if (!cleanedPhone) {
+    return { placed: false, openedDialer: false, error: "No phone number set." };
+  }
+
+  const native = getNativeSms();
+  if (native?.placeCall) {
+    try {
+      await native.placeCall({ number: cleanedPhone });
+      return { placed: true, openedDialer: false };
+    } catch (e) {
+      return {
+        placed: false,
+        openedDialer: false,
+        error: e instanceof Error ? e.message : "Native call failed.",
+      };
+    }
+  }
+
+  // Web/PWA fallback — open the system dialer.
+  try {
+    if (typeof window !== "undefined") {
+      window.location.href = `tel:${cleanedPhone}`;
+      return { placed: false, openedDialer: true };
+    }
+    return { placed: false, openedDialer: false, error: "Window not available." };
+  } catch (e) {
+    return {
+      placed: false,
+      openedDialer: false,
+      error: e instanceof Error ? e.message : "Could not open dialer.",
     };
   }
 }

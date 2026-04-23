@@ -1,4 +1,4 @@
-import { ReactNode, useEffect } from "react";
+import { ReactNode, useEffect, useRef } from "react";
 import { Link, useLocation } from "wouter";
 import { Camera, Settings, Activity, Info, Volume2, VolumeX, ShieldAlert } from "lucide-react";
 import { useSmartCane } from "@/hooks/use-smart-cane";
@@ -21,14 +21,45 @@ export function Layout({ children }: { children: ReactNode }) {
     }
   };
 
-  const handleManualSos = async () => {
-    toast({ title: "Sending SOS", description: "Getting your location..." });
-    const result = await triggerSos();
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressFired = useRef(false);
+
+  const fireSos = async (alsoCall: boolean) => {
     toast({
-      title: result.ok ? "SOS triggered" : "SOS failed",
+      title: alsoCall ? "Sending SOS + calling" : "Sending SOS",
+      description: "Getting your location...",
+    });
+    const result = await triggerSos({ alsoCall });
+    toast({
+      title: result.ok ? (alsoCall ? "SOS sent + calling guardian" : "SOS triggered") : "SOS failed",
       description: result.message,
       variant: result.ok ? "default" : "destructive",
     });
+  };
+
+  const handleSosPressStart = () => {
+    longPressFired.current = false;
+    if (longPressTimer.current) clearTimeout(longPressTimer.current);
+    longPressTimer.current = setTimeout(() => {
+      longPressFired.current = true;
+      fireSos(true);
+    }, 700);
+  };
+
+  const handleSosPressEnd = () => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  };
+
+  const handleSosClick = () => {
+    // If long-press already fired, swallow the click.
+    if (longPressFired.current) {
+      longPressFired.current = false;
+      return;
+    }
+    fireSos(false);
   };
 
   useEffect(() => {
@@ -55,9 +86,16 @@ export function Layout({ children }: { children: ReactNode }) {
 
         <div className="flex items-center gap-2">
           <button
-            onClick={handleManualSos}
-            className="px-3 py-2 rounded-full flex items-center gap-2 bg-destructive/15 text-destructive border border-destructive/30 active:scale-95 transition-transform font-semibold"
-            aria-label="Send SOS to guardian"
+            onClick={handleSosClick}
+            onMouseDown={handleSosPressStart}
+            onMouseUp={handleSosPressEnd}
+            onMouseLeave={handleSosPressEnd}
+            onTouchStart={handleSosPressStart}
+            onTouchEnd={handleSosPressEnd}
+            onTouchCancel={handleSosPressEnd}
+            onContextMenu={(e) => e.preventDefault()}
+            className="px-3 py-2 rounded-full flex items-center gap-2 bg-destructive/15 text-destructive border border-destructive/30 active:scale-95 transition-transform font-semibold select-none"
+            aria-label="Send SOS to guardian. Tap to text, hold to also call."
             data-testid="button-sos-header"
           >
             <ShieldAlert className="w-5 h-5" />

@@ -3,7 +3,7 @@ import { ESP32Client, SensorReading, ConnState, SosEvent } from "@/lib/esp32";
 import { getHost, getGuardianPhone, getUserName } from "@/lib/settings";
 import { announceObstacle, speakUrgent } from "@/lib/tts";
 import { getLocationOnce, googleMapsLink } from "@/lib/geo";
-import { sendSms, buildSosMessage } from "@/lib/sms";
+import { sendSms, buildSosMessage, placeCall } from "@/lib/sms";
 
 export interface SosOutcome {
   ok: boolean;
@@ -21,7 +21,7 @@ interface SmartCaneContextValue {
   reconnect: () => void;
   lastSos: SosEvent | null;
   lastSosOutcome: SosOutcome | null;
-  triggerSos: () => Promise<SosOutcome>;
+  triggerSos: (opts?: { alsoCall?: boolean }) => Promise<SosOutcome>;
 }
 
 const SmartCaneContext = createContext<SmartCaneContextValue | undefined>(undefined);
@@ -40,7 +40,8 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
   audioMutedRef.current = audioMuted;
   const sosInFlight = useRef(false);
 
-  const triggerSos = useCallback(async (): Promise<SosOutcome> => {
+  const triggerSos = useCallback(async (opts?: { alsoCall?: boolean }): Promise<SosOutcome> => {
+    const alsoCall = opts?.alsoCall ?? false;
     if (sosInFlight.current) {
       return { ok: false, message: "SOS already in progress." };
     }
@@ -57,7 +58,7 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
         return out;
       }
 
-      speakUrgent("Sending S O S to guardian.");
+      speakUrgent(alsoCall ? "Sending S O S and calling guardian." : "Sending S O S to guardian.");
 
       let mapsLink = "(location unavailable)";
       try {
@@ -73,21 +74,47 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
       const body = buildSosMessage({ userName: getUserName(), mapsLink });
       const result = await sendSms(phone, body);
 
-      let out: SosOutcome;
+      let smsMsg: string;
+      let smsOk: boolean;
       if (result.sent) {
-        out = { ok: true, message: "SOS sent to guardian.", mapsLink };
-        speakUrgent("S O S sent.");
+        smsMsg = "SOS sent to guardian.";
+        smsOk = true;
       } else if (result.openedComposer) {
-        out = {
-          ok: true,
-          message: "Opened your SMS app — tap Send to dispatch.",
-          mapsLink,
-        };
-        speakUrgent("Opened messages. Please send.");
+        smsMsg = "Opened your SMS app — tap Send to dispatch.";
+        smsOk = true;
       } else {
-        out = { ok: false, message: result.error ?? "Failed to send SOS.", mapsLink };
+        smsMsg = result.error ?? "Failed to send SOS.";
+        smsOk = false;
+      }
+
+      let callMsg = "";
+      let callOk = true;
+      if (alsoCall) {
+        const callRes = await placeCall(phone);
+        if (callRes.placed) {
+          callMsg = " Calling guardian now.";
+        } else if (callRes.openedDialer) {
+          callMsg = " Dialer opened — tap call.";
+        } else {
+          callMsg = ` Call failed: ${callRes.error ?? "unknown"}.`;
+          callOk = false;
+        }
+      }
+
+      const out: SosOutcome = {
+        ok: smsOk && callOk,
+        message: smsMsg + callMsg,
+        mapsLink,
+      };
+
+      if (smsOk && (!alsoCall || callOk)) {
+        speakUrgent(alsoCall ? "S O S sent. Calling guardian." : "S O S sent.");
+      } else if (!smsOk && alsoCall && callOk) {
+        speakUrgent("Message failed, calling guardian.");
+      } else {
         speakUrgent("S O S send failed.");
       }
+
       setLastSosOutcome(out);
       return out;
     } finally {
@@ -133,8 +160,9 @@ export function SmartCaneProvider({ children }: { children: ReactNode }) {
 
       c.onSos((evt) => {
         setLastSos(evt);
+        // Hardware SOS button = full panic: SMS + call.
         // Fire and forget — UI subscribes to lastSosOutcome for the result.
-        triggerSos();
+        triggerSos({ alsoCall: true });
       });
 
       c.connect();

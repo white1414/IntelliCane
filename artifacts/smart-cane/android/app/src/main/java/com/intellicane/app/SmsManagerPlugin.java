@@ -1,7 +1,8 @@
 package com.intellicane.app;
 
 import android.Manifest;
-import android.content.pm.PackageManager;
+import android.content.Intent;
+import android.net.Uri;
 import android.os.Build;
 import android.telephony.SmsManager;
 
@@ -18,17 +19,20 @@ import com.getcapacitor.annotation.PermissionCallback;
 import java.util.ArrayList;
 
 /**
- * IntelliCane silent-SMS plugin.
+ * IntelliCane silent-SMS + emergency-call plugin.
  *
- * Sends an SMS through Android's SmsManager with NO user confirmation.
- * Requires the SEND_SMS runtime permission, which we ask for on first use.
+ * - send():       sends an SMS through Android's SmsManager with no UI prompt.
+ * - placeCall():  starts an outgoing phone call directly via ACTION_CALL.
+ *
+ * Both methods request their own runtime permission on first use.
  *
  * Exposed as `SmsManager` to JS — matches what src/lib/sms.ts looks for.
  */
 @CapacitorPlugin(
     name = "SmsManager",
     permissions = {
-        @Permission(strings = { Manifest.permission.SEND_SMS }, alias = "sms")
+        @Permission(strings = { Manifest.permission.SEND_SMS },   alias = "sms"),
+        @Permission(strings = { Manifest.permission.CALL_PHONE }, alias = "phone")
     }
 )
 public class SmsManagerPlugin extends Plugin {
@@ -106,6 +110,46 @@ public class SmsManagerPlugin extends Plugin {
             call.resolve(ret);
         } catch (Exception e) {
             call.reject("SmsManager error: " + e.getMessage(), e);
+        }
+    }
+
+    @PluginMethod
+    public void placeCall(PluginCall call) {
+        if (getPermissionState("phone") != PermissionState.GRANTED) {
+            requestPermissionForAlias("phone", call, "phonePermissionCallback");
+            return;
+        }
+        doCall(call);
+    }
+
+    @PermissionCallback
+    private void phonePermissionCallback(PluginCall call) {
+        if (getPermissionState("phone") == PermissionState.GRANTED) {
+            doCall(call);
+        } else {
+            call.reject("CALL_PHONE permission was denied. Cannot place SOS call.");
+        }
+    }
+
+    private void doCall(PluginCall call) {
+        String number = call.getString("number");
+        if (number == null || number.isEmpty()) {
+            call.reject("No phone number provided.");
+            return;
+        }
+        try {
+            Intent intent = new Intent(Intent.ACTION_CALL);
+            intent.setData(Uri.parse("tel:" + number));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(intent);
+
+            JSObject ret = new JSObject();
+            ret.put("placed", true);
+            call.resolve(ret);
+        } catch (SecurityException se) {
+            call.reject("Missing CALL_PHONE permission: " + se.getMessage(), se);
+        } catch (Exception e) {
+            call.reject("Failed to place call: " + e.getMessage(), e);
         }
     }
 }
