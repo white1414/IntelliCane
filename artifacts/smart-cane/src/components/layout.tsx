@@ -21,8 +21,12 @@ export function Layout({ children }: { children: ReactNode }) {
     }
   };
 
-  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const longPressFired = useRef(false);
+  const smsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const callTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const smsFired = useRef(false);
+
+  const SMS_HOLD_MS = 900;
+  const CALL_HOLD_MS = 2000;
 
   const fireSos = async (alsoCall: boolean) => {
     toast({
@@ -37,29 +41,58 @@ export function Layout({ children }: { children: ReactNode }) {
     });
   };
 
+  const clearSosTimers = () => {
+    if (smsTimer.current) {
+      clearTimeout(smsTimer.current);
+      smsTimer.current = null;
+    }
+    if (callTimer.current) {
+      clearTimeout(callTimer.current);
+      callTimer.current = null;
+    }
+  };
+
   const handleSosPressStart = () => {
-    longPressFired.current = false;
-    if (longPressTimer.current) clearTimeout(longPressTimer.current);
-    longPressTimer.current = setTimeout(() => {
-      longPressFired.current = true;
-      fireSos(true);
-    }, 700);
+    smsFired.current = false;
+    clearSosTimers();
+    smsTimer.current = setTimeout(() => {
+      smsFired.current = true;
+      fireSos(false);
+    }, SMS_HOLD_MS);
+    callTimer.current = setTimeout(() => {
+      // Escalate: place the call. SMS already fired at 900ms, so call only.
+      placeCallEscalation();
+    }, CALL_HOLD_MS);
+  };
+
+  const placeCallEscalation = async () => {
+    // Direct call only — SMS has already gone out.
+    const { placeCall } = await import("@/lib/sms");
+    const { getGuardianPhone } = await import("@/lib/settings");
+    const phone = getGuardianPhone();
+    if (!phone) return;
+    toast({ title: "Calling guardian", description: "Placing emergency call..." });
+    const res = await placeCall(phone);
+    toast({
+      title: res.placed || res.openedDialer ? "Calling guardian" : "Call failed",
+      description: res.placed
+        ? "Call started."
+        : res.openedDialer
+        ? "Dialer opened — tap call."
+        : res.error ?? "Unknown error.",
+      variant: res.placed || res.openedDialer ? "default" : "destructive",
+    });
   };
 
   const handleSosPressEnd = () => {
-    if (longPressTimer.current) {
-      clearTimeout(longPressTimer.current);
-      longPressTimer.current = null;
-    }
+    clearSosTimers();
   };
 
   const handleSosClick = () => {
-    // If long-press already fired, swallow the click.
-    if (longPressFired.current) {
-      longPressFired.current = false;
-      return;
+    // Swallow the click — short taps do nothing; user must hold ≥ 900ms.
+    if (smsFired.current) {
+      smsFired.current = false;
     }
-    fireSos(false);
   };
 
   useEffect(() => {
@@ -95,7 +128,7 @@ export function Layout({ children }: { children: ReactNode }) {
             onTouchCancel={handleSosPressEnd}
             onContextMenu={(e) => e.preventDefault()}
             className="px-3 py-2 rounded-full flex items-center gap-2 bg-destructive/15 text-destructive border border-destructive/30 active:scale-95 transition-transform font-semibold select-none"
-            aria-label="Send SOS to guardian. Tap to text, hold to also call."
+            aria-label="Send SOS to guardian. Hold for nearly one second to text. Keep holding for two seconds to also call."
             data-testid="button-sos-header"
           >
             <ShieldAlert className="w-5 h-5" />
