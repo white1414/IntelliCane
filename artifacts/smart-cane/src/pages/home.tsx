@@ -103,15 +103,16 @@ export default function Home() {
       return () => {
         if (loopRef.current) cancelAnimationFrame(loopRef.current);
       };
-    } else {
-      if (loopRef.current) cancelAnimationFrame(loopRef.current);
-      if (drawCanvasRef.current) {
-        const ctx = drawCanvasRef.current.getContext("2d");
-        if (ctx) ctx.clearRect(0, 0, drawCanvasRef.current.width, drawCanvasRef.current.height);
-      }
-      setFps(0);
-      setInfTime(0);
     }
+
+    if (loopRef.current) cancelAnimationFrame(loopRef.current);
+    if (drawCanvasRef.current) {
+      const ctx = drawCanvasRef.current.getContext("2d");
+      if (ctx) ctx.clearRect(0, 0, drawCanvasRef.current.width, drawCanvasRef.current.height);
+    }
+    setFps(0);
+    setInfTime(0);
+    return undefined;
   }, [isRunning, modelReady, state, audioMuted]);
 
   // Sync draw canvas size with img

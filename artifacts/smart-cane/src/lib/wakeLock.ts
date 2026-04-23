@@ -6,7 +6,7 @@ interface WakeLockSentinel {
   addEventListener: (type: "release", listener: () => void) => void;
 }
 
-interface WakeLockNavigator extends Navigator {
+interface WakeLockNavigator {
   wakeLock?: { request: (type: "screen") => Promise<WakeLockSentinel> };
 }
 
