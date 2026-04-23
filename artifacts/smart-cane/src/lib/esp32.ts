@@ -48,6 +48,8 @@ type SosListener    = (evt: SosEvent) => void;
 // WiFi" screen even though the SoftAP was still up.
 const SENSOR_POLL_MS = 250;   // 4 Hz — plenty for distance UI.
 const SOS_POLL_MS    = 700;   // ~1.4 Hz — catches even short presses.
+const HEALTH_POLL_MS = 3000;  // ~0.3 Hz — cheap liveness probe for the
+                              //          "last contact" pill.
 const SENSOR_FAIL_BACKOFF_MS = 1500;
 // We only flip to "error" after a sustained string of failures so a
 // single dropped poll (e.g. the camera tab swap) doesn't blow away
@@ -62,9 +64,13 @@ export class ESP32Client {
   private state: ConnState = "disconnected";
   private sensorTimer: number | null = null;
   private sosTimer:    number | null = null;
+  private healthTimer: number | null = null;
   private running = false;
   private failCount = 0;
   private lastSensorOkAt = 0;
+  private lastHealthOkAt = 0;
+  private lastFrameAt    = 0;
+  private lastHealth: { uptimeMs: number; freeHeap: number; version: string } | null = null;
 
   constructor(host: string) {
     this.host = host.replace(/^https?:\/\//, "").replace(/\/$/, "");
@@ -101,6 +107,33 @@ export class ESP32Client {
     return this.failCount;
   }
 
+  // Most recent moment we got ANY proof of life from the cane — sensor
+  // poll, health poll, or a delivered MJPEG frame. Used by the cane
+  // status screen's "last contact" pill so judges can see at a glance
+  // that we're really talking to the hardware.
+  get lastContactMs(): number | null {
+    const ts = Math.max(this.lastSensorOkAt, this.lastHealthOkAt, this.lastFrameAt);
+    if (ts === 0) return null;
+    return Date.now() - ts;
+  }
+
+  get healthSnapshot(): { uptimeMs: number; freeHeap: number; version: string } | null {
+    return this.lastHealth;
+  }
+
+  // Called by the home page's <img onLoad> every time the WebView
+  // successfully decodes a new MJPEG frame. Without this hook we have
+  // no way of knowing whether the stream socket is actually delivering
+  // frames vs. just sitting there with the headers received.
+  markFrameReceived() {
+    this.lastFrameAt = Date.now();
+  }
+
+  get lastFrameAgeMs(): number | null {
+    if (this.lastFrameAt === 0) return null;
+    return Date.now() - this.lastFrameAt;
+  }
+
   // POST /vibrate?on=1|0 — tells the Nano (via ESP32 UART) to drive the
   // vibration motor non-stop, used during a suspected-fall countdown.
   async setVibrate(on: boolean): Promise<boolean> {
@@ -125,12 +158,14 @@ export class ESP32Client {
     this.setState("connecting");
     this.scheduleSensorPoll(0);
     this.scheduleSosPoll(SOS_POLL_MS);
+    this.scheduleHealthPoll(0);
   }
 
   disconnect() {
     this.running = false;
     if (this.sensorTimer !== null) { window.clearTimeout(this.sensorTimer); this.sensorTimer = null; }
     if (this.sosTimer !== null)    { window.clearTimeout(this.sosTimer);    this.sosTimer    = null; }
+    if (this.healthTimer !== null) { window.clearTimeout(this.healthTimer); this.healthTimer = null; }
     this.setState("disconnected");
   }
 
@@ -166,6 +201,39 @@ export class ESP32Client {
     if (!this.running) return;
     if (this.sosTimer !== null) window.clearTimeout(this.sosTimer);
     this.sosTimer = window.setTimeout(() => this.pollSos(), delay);
+  }
+
+  private scheduleHealthPoll(delay: number) {
+    if (!this.running) return;
+    if (this.healthTimer !== null) window.clearTimeout(this.healthTimer);
+    this.healthTimer = window.setTimeout(() => this.pollHealth(), delay);
+  }
+
+  private async pollHealth() {
+    try {
+      const ctrl = new AbortController();
+      const tid = window.setTimeout(() => ctrl.abort(), 1500);
+      const resp = await fetch(`http://${this.host}/health`, {
+        cache: "no-store",
+        signal: ctrl.signal,
+      });
+      window.clearTimeout(tid);
+      if (resp.ok) {
+        const body = await resp.json();
+        if (body && body.ok) {
+          this.lastHealthOkAt = Date.now();
+          this.lastHealth = {
+            uptimeMs: Number(body.uptime_ms) || 0,
+            freeHeap: Number(body.free_heap) || 0,
+            version:  String(body.version || "?"),
+          };
+        }
+      }
+    } catch {
+      /* swallow — pollSensors is the source of truth for connection state */
+    } finally {
+      this.scheduleHealthPoll(HEALTH_POLL_MS);
+    }
   }
 
   private async pollSensors() {

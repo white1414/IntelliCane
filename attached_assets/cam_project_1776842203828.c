@@ -30,6 +30,9 @@
 //   GET  /sensors     — JSON, latest Nano sensor reading
 //   POST /vibrate?on=1  — start continuous vibrate on the Nano motor
 //   POST /vibrate?on=0  — stop continuous vibrate
+//   GET  /health      — JSON liveness probe for the phone's "last contact" pill.
+//                       Shape: {"ok":true,"uptime_ms":...,"free_heap":...,
+//                              "stream_port":81,"version":"v2.1"}
 
 #include <string.h>
 #include <stdio.h>
@@ -129,6 +132,7 @@ static esp_err_t      frame_handler(httpd_req_t *req);
 static esp_err_t      sos_handler(httpd_req_t *req);
 static esp_err_t      sensors_handler(httpd_req_t *req);
 static esp_err_t      vibrate_handler(httpd_req_t *req);
+static esp_err_t      health_handler(httpd_req_t *req);
 static httpd_handle_t start_webserver(void);
 static void           sos_button_init(void);
 static void           sos_button_task(void *arg);
@@ -328,6 +332,26 @@ static esp_err_t vibrate_handler(httpd_req_t *req) {
     return httpd_resp_send(req, resp, len);
 }
 
+/* ---------------- /health endpoint ---------------- */
+//
+// Cheap, side-effect-free liveness probe. The phone polls this every few
+// seconds and uses the most recent success as the "last contact" indicator
+// shown on the cane status screen — useful both for the user and for
+// proving connectivity to a competition judge at a glance.
+static esp_err_t health_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    char resp[192];
+    int len = snprintf(resp, sizeof(resp),
+        "{\"ok\":true,\"uptime_ms\":%lld,\"free_heap\":%u,"
+        "\"stream_port\":81,\"version\":\"v2.1\"}",
+        (long long)(esp_timer_get_time() / 1000LL),
+        (unsigned)esp_get_free_heap_size());
+    return httpd_resp_send(req, resp, len);
+}
+
 // CORS preflight for /vibrate (browsers will send OPTIONS first for POST
 // from a different origin). Any URI matches; we only register OPTIONS.
 static esp_err_t options_handler(httpd_req_t *req) {
@@ -380,8 +404,14 @@ static httpd_handle_t start_control_server(void) {
     config.max_uri_handlers = 12;
     // Control endpoints are short-lived. Aggressively purge dead sockets
     // so a flaky Capacitor WebView can't squat on slots for a minute.
+    //
+    // NOTE on socket budget: ESP-IDF's LWIP defaults to LWIP_MAX_SOCKETS=10.
+    // The SoftAP stack itself burns ~2 sockets (DHCP + DNS), so we have ~8
+    // to share between the control and stream httpd instances. Keep the
+    // sums conservative or the second httpd_start() will silently fail
+    // with ESP_ERR_HTTPD_ALLOC_MEM and you'll get a black stream forever.
     config.lru_purge_enable  = true;
-    config.max_open_sockets  = 7;
+    config.max_open_sockets  = 4;
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
     config.keep_alive_enable = false;
@@ -397,12 +427,15 @@ static httpd_handle_t start_control_server(void) {
     httpd_uri_t sensors_uri  = { .uri="/sensors",   .method=HTTP_GET,    .handler=sensors_handler };
     httpd_uri_t vibrate_uri  = { .uri="/vibrate",   .method=HTTP_POST,   .handler=vibrate_handler };
     httpd_uri_t vibrate_opts = { .uri="/vibrate",   .method=HTTP_OPTIONS,.handler=options_handler };
+    httpd_uri_t health_uri   = { .uri="/health",    .method=HTTP_GET,    .handler=health_handler };
     httpd_register_uri_handler(server, &frame_uri);
     httpd_register_uri_handler(server, &sos_uri);
     httpd_register_uri_handler(server, &sensors_uri);
     httpd_register_uri_handler(server, &vibrate_uri);
     httpd_register_uri_handler(server, &vibrate_opts);
-    ESP_LOGI(TAG, "Control HTTP server up on :80");
+    httpd_register_uri_handler(server, &health_uri);
+    ESP_LOGI(TAG, "Control HTTP server up on :80 (free heap %u)",
+             (unsigned)esp_get_free_heap_size());
     return server;
 }
 
@@ -414,8 +447,11 @@ static httpd_handle_t start_stream_server(void) {
     config.max_uri_handlers = 2;
     // Stream pool only ever needs one or two sockets — but give it room
     // so a tab refresh doesn't immediately strangle the new connection.
+    // Stream pool only ever needs one socket per viewer. Keep this tight
+    // so we leave headroom for the control server + the SoftAP's own
+    // DHCP/DNS sockets. (See note in start_control_server.)
     config.lru_purge_enable  = true;
-    config.max_open_sockets  = 4;
+    config.max_open_sockets  = 3;
     // Long timeouts: the stream send loop legitimately blocks for tens of
     // ms while the camera produces the next JPEG; we don't want LWIP
     // declaring it dead.
@@ -424,13 +460,20 @@ static httpd_handle_t start_stream_server(void) {
     config.keep_alive_enable = false;
 
     httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start stream httpd");
+    esp_err_t err = httpd_start(&server, &config);
+    if (err != ESP_OK) {
+        // This is the silent killer: if this fails the phone will see a
+        // healthy /sensors poll on :80 (so it shows "connected") but the
+        // <img src=:81/> never loads → black screen, 0fps. Make the
+        // failure loud so it shows up in the ESP-IDF monitor.
+        ESP_LOGE(TAG, "*** Stream httpd failed to start on :81 (err=0x%x). "
+                      "Phone will see a black live feed. ***", err);
         return NULL;
     }
     httpd_uri_t stream_uri = { .uri="/", .method=HTTP_GET, .handler=stream_handler };
     httpd_register_uri_handler(server, &stream_uri);
-    ESP_LOGI(TAG, "Stream HTTP server up on :81");
+    ESP_LOGI(TAG, "Stream HTTP server up on :81 (free heap %u)",
+             (unsigned)esp_get_free_heap_size());
     return server;
 }
 
