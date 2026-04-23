@@ -12,7 +12,7 @@
     <title>IntelliCane</title>
     <!--
       Load TensorFlow.js + TFLite as classic UMD scripts from /tflite-wasm/.
-      Order matters: tf-core defines window.tf, the WASM backend registers
+      Order matters: tf-core defines window.tf, each backend registers
       itself onto window.tf, then tf-tflite hangs window.tflite off it.
 
       We deliberately do NOT bundle "@tensorflow/tfjs-tflite" through
@@ -21,8 +21,15 @@
       file in node_modules — the bundler bakes that absolute dev URL into
       the production output, which 404s inside the Capacitor APK and
       causes a white-screen on launch.
+
+      Backend priority (set in yolo.ts selectBestBackend):
+        1. webgpu — GPU via WebGPU API (Chromium 113+). Fastest.
+        2. webgl  — GPU via WebGL2. Available on virtually all Android.
+        3. wasm   — CPU via WASM (with SIMD if supported).
+        4. cpu    — pure JS fallback. Slowest.
     -->
     <script src="./tflite-wasm/tf-core.min.js"></script>
+    <script src="./tflite-wasm/tf-backend-webgl.min.js"></script>
     <script src="./tflite-wasm/tf-backend-wasm.min.js"></script>
     <script src="./tflite-wasm/tf-tflite.min.js"></script>
   </head>

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ESP32Client } from "@/lib/esp32";
 import { useSmartCane } from "@/hooks/use-smart-cane";
-import { loadModel, detect, Detection, isModelLoaded } from "@/lib/yolo";
+import { loadModel, detect, Detection, isModelLoaded, getActiveBackend } from "@/lib/yolo";
 import { getConfThreshold, getTargetFps } from "@/lib/settings";
 import { announceDetection } from "@/lib/tts";
 import { useWakeLock } from "@/lib/wakeLock";
@@ -253,6 +253,7 @@ export default function Home() {
               <div className="absolute top-2 left-2 bg-black/60 backdrop-blur text-white text-xs px-2 py-1 rounded-md font-mono flex flex-col">
                 <span>{infTime}ms</span>
                 <span>{fps} FPS</span>
+                <span className="text-[10px] opacity-60">{getActiveBackend()}</span>
               </div>
             )}
 

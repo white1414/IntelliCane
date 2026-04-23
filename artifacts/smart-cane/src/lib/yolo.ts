@@ -7,21 +7,46 @@
 // node_modules URL of `tflite_web_api_client.js` into the build, which
 // 404s on device and white-screens the app.
 //
+// BACKEND SELECTION (the most impactful performance knob):
+//   The tf-core backend handles pre/post-processing (tensor creation, NMS,
+//   etc.). The TFLite C++ runtime handles the actual model inference.
+//
+//   For tf-core pre/post-processing we try backends in this order:
+//     1. "webgpu"  — uses the phone's GPU via WebGPU API. Available in
+//                    Android WebView Chromium 113+. Fastest for tensor ops.
+//     2. "webgl"   — uses the phone's GPU via WebGL2. Available on
+//                    virtually all Android WebViews. Good GPU fallback.
+//     3. "wasm"    — CPU via WebAssembly (with SIMD if supported).
+//                    Reliable, works everywhere, but CPU-only.
+//     4. "cpu"     — pure JS fallback. Slowest.
+//
+//   For the TFLite model inference itself, the C++ runtime always uses
+//   its own WASM backend (with SIMD+threads when available). The
+//   tf-core backend choice only affects pre/post-processing speed.
+//   However, using a GPU backend for pre/post still gives a meaningful
+//   speedup because tensor creation and NMS are non-trivial at 640x640.
+//
 // We import *types only* so the rest of the file stays type-safe.
 import type * as TFCoreNS from "@tensorflow/tfjs-core";
 import type * as TFLiteNS from "@tensorflow/tfjs-tflite";
 import { CLASS_NAMES } from "./labels";
 
+// Extended TF type that includes backend registration methods
+// that are added by the UMD script includes (wasm, webgl, webgpu).
+type TFExtended = typeof TFCoreNS & {
+  wasm?: { setWasmPaths?: (path: string) => void };
+  webgpu?: { register?: () => void };
+  webgl?: { register?: () => void };
+};
+
 declare global {
   interface Window {
-    tf?: typeof TFCoreNS & {
-      wasm?: { setWasmPaths?: (path: string) => void };
-    };
+    tf?: TFExtended;
     tflite?: typeof TFLiteNS;
   }
 }
 
-function getTf(): typeof TFCoreNS {
+function getTf(): TFExtended {
   const t = window.tf;
   if (!t) {
     throw new Error(
@@ -58,6 +83,50 @@ export interface Detection {
 let model: TFLiteNS.TFLiteModel | null = null;
 let loading: Promise<TFLiteNS.TFLiteModel> | null = null;
 
+// Which tf-core backend is currently active. Exposed so the UI can
+// show the user what hardware is being used (GPU vs CPU).
+let activeBackend: string = "unknown";
+
+export function getActiveBackend(): string {
+  return activeBackend;
+}
+
+// Try backends in priority order. Returns the first one that
+// successfully initializes, or "cpu" as the final fallback.
+async function selectBestBackend(tf: TFExtended): Promise<string> {
+  const candidates = ["webgpu", "webgl", "wasm", "cpu"];
+
+  for (const backend of candidates) {
+    try {
+      // Register the backend plugin if it exists but hasn't been
+      // registered yet (WebGL and WebGPU are separate <script> includes
+      // that self-register, but WASM needs setWasmPaths first).
+      if (backend === "wasm") {
+        const base = import.meta.env.BASE_URL.replace(/\/$/, "") + "/tflite-wasm/";
+        tf.wasm?.setWasmPaths?.(base);
+      }
+
+      await tf.setBackend(backend);
+      await tf.ready();
+
+      // Verify the backend actually works by creating a tiny tensor.
+      const test = tf.tensor1d([1, 2, 3]);
+      test.dispose();
+
+      activeBackend = backend;
+      console.log(`[YOLO] tf-core backend: ${backend} (GPU: ${backend === "webgpu" || backend === "webgl"})`);
+      return backend;
+    } catch (e) {
+      console.warn(`[YOLO] Backend "${backend}" failed:`, e);
+      continue;
+    }
+  }
+
+  // Should never reach here since "cpu" always works, but just in case.
+  activeBackend = "cpu";
+  return "cpu";
+}
+
 export async function loadModel(modelUrl: string): Promise<TFLiteNS.TFLiteModel> {
   if (model) return model;
   if (loading) return loading;
@@ -69,13 +138,11 @@ export async function loadModel(modelUrl: string): Promise<TFLiteNS.TFLiteModel>
   // app works fully offline once installed (the cane has no internet —
   // the phone is joined to the ESP32 SoftAP).
   const base = import.meta.env.BASE_URL.replace(/\/$/, "") + "/tflite-wasm/";
-  // tfjs-backend-wasm path (used as the tf-core backend for pre/post-processing).
-  tf.wasm?.setWasmPaths?.(base);
   // tfjs-tflite C++ runtime path.
   tflite.setWasmPath(base);
 
-  await tf.setBackend("wasm").catch(() => tf.setBackend("cpu"));
-  await tf.ready();
+  // Select the best available tf-core backend (GPU first, then CPU).
+  await selectBestBackend(tf);
 
   loading = tflite
     .loadTFLiteModel(modelUrl, {

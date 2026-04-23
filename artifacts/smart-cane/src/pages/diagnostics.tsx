@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { useSmartCane } from "@/hooks/use-smart-cane";
-import { isModelLoaded } from "@/lib/yolo";
+import { isModelLoaded, getActiveBackend } from "@/lib/yolo";
 import { speakUrgent, ttsAvailable, stopSpeaking } from "@/lib/tts";
 import { useWakeLock } from "@/lib/wakeLock";
 import { Button } from "@/components/ui/button";
@@ -262,6 +262,12 @@ export default function DiagnosticsPage() {
             <span>YOLO TFLite Model</span>
             <Badge variant={isModelLoaded() ? "default" : "secondary"}>
               {isModelLoaded() ? "Loaded" : "Not loaded yet"}
+            </Badge>
+          </li>
+          <li className="flex justify-between items-center">
+            <span>TF Backend (pre/post)</span>
+            <Badge variant={getActiveBackend() === "webgpu" || getActiveBackend() === "webgl" ? "default" : "secondary"}>
+              {getActiveBackend() === "webgpu" ? "WebGPU (GPU)" : getActiveBackend() === "webgl" ? "WebGL (GPU)" : getActiveBackend() === "wasm" ? "WASM (CPU)" : getActiveBackend() === "cpu" ? "CPU" : getActiveBackend()}
             </Badge>
           </li>
         </ul>
