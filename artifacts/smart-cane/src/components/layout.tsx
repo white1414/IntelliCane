@@ -57,9 +57,11 @@ export function Layout({ children }: { children: ReactNode }) {
     clearSosTimers();
     smsTimer.current = setTimeout(() => {
       smsFired.current = true;
+      if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(80);
       fireSos(false);
     }, SMS_HOLD_MS);
     callTimer.current = setTimeout(() => {
+      if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate([0, 200, 80, 200]);
       // Escalate: place the call. SMS already fired at 900ms, so call only.
       placeCallEscalation();
     }, CALL_HOLD_MS);
