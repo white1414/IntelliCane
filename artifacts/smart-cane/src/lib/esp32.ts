@@ -71,8 +71,10 @@ export class ESP32Client {
   }
 
   get streamUrl(): string {
-    // Root URL serves MJPEG in the IntelliCane firmware.
-    return `http://${this.host}/`;
+    // MJPEG now lives on its own httpd instance at :81 so polling
+    // /sensors and /sos on :80 cannot evict the long-lived stream
+    // socket (see ESP32-CAM firmware comment block in start_webserver).
+    return `http://${this.host}:81/`;
   }
 
   get snapshotUrl(): string {

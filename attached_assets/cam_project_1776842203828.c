@@ -338,59 +338,107 @@ static esp_err_t options_handler(httpd_req_t *req) {
     return httpd_resp_send(req, NULL, 0);
 }
 
-/* ---------------- HTTP server ---------------- */
-static httpd_handle_t start_webserver(void) {
+/* ---------------- HTTP server(s) ---------------- */
+//
+// We run TWO independent httpd instances, on TWO different TCP ports, each
+// with its OWN socket pool. This is the canonical fix for "MJPEG dies after
+// a few seconds + httpd_sock_err: error in send/recv : 104" on ESP32-CAM.
+//
+// Why two servers:
+//   The MJPEG stream (`GET /`) is a single, never-ending response — that
+//   socket is held open for as long as the phone is watching the feed.
+//   Meanwhile the phone polls /sos, /sensors, and POSTs /vibrate every
+//   couple hundred ms. With ONE server they share ONE socket pool. Even
+//   with lru_purge_enable=true and max_open_sockets bumped to 13, Chromium
+//   on Android (Capacitor WebView) racks up half-closed sockets fast — and
+//   when the pool fills, the LRU policy kills the oldest socket, which IS
+//   the MJPEG stream. The server then logs:
+//       W httpd_txrx: httpd_sock_err: error in send : 104   (ECONNRESET)
+//       W httpd_txrx: httpd_sock_err: error in recv : 104
+//   the JS <img> goes into onerror, the user sees the disconnect screen,
+//   AND /sos polling fails too — so the SOS button "does nothing" even
+//   though the firmware detected the press correctly.
+//
+// Splitting into two servers gives the stream its OWN dedicated pool that
+// short-lived control polls cannot evict. This is the same pattern used by
+// the official esp32-camera CameraWebServer example (port 80 = control,
+// port 81 = stream).
+//
+//   Port 80  -> control  : /frame.jpg, /sos, /sensors, /vibrate
+//   Port 81  -> streaming: /              (MJPEG)
+//
+// Phone client should fetch the stream from `http://192.168.4.1:81/`.
+
+static httpd_handle_t s_ctrl_server   = NULL;
+static httpd_handle_t s_stream_server = NULL;
+
+static httpd_handle_t start_control_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size  = 8192;
+    config.server_port      = 80;
+    config.ctrl_port        = 32768;        // must differ from stream server
+    config.stack_size       = 8192;
     config.max_uri_handlers = 12;
-    // ----------------------------------------------------------------
-    // Socket-pool tuning. Without these, the live feed dies after ~5–15 s.
-    //
-    // Why: the phone holds ONE long-lived socket on the MJPEG stream
-    // (GET /), and the JS client also polls /sensors and /sos. The
-    // default pool is 7 sockets with NO LRU eviction, so once Chromium
-    // racks up a few half-closed connections (every camera-tab unmount
-    // tears the MJPEG socket which the ESP server logs as "errno 104,
-    // ECONNRESET"), the pool fills, NEW fetches start being refused,
-    // and the JS flips state→"error" → it unmounts <img> → MJPEG dies →
-    // user sees the "make sure you connect to IntelliCane WiFi" screen.
-    //
-    // Fixes:
-    //   - lru_purge_enable: drop the oldest socket when full, instead
-    //     of refusing the new one.
-    //   - max_open_sockets: bump as high as CONFIG_LWIP_MAX_SOCKETS
-    //     allows on this build.
-    //   - recv/send_wait_timeout: short, so a half-dead Chromium socket
-    //     doesn't squat on a slot for a minute.
-    //   - keep_alive_enable=false: with only ~13 sockets total, we'd
-    //     rather have each /sensors poll close immediately and free a
-    //     slot than reuse one keep-alive socket per origin.
-    // ----------------------------------------------------------------
+    // Control endpoints are short-lived. Aggressively purge dead sockets
+    // so a flaky Capacitor WebView can't squat on slots for a minute.
     config.lru_purge_enable  = true;
-    config.max_open_sockets  = 13;
+    config.max_open_sockets  = 7;
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
     config.keep_alive_enable = false;
+
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start httpd");
+        ESP_LOGE(TAG, "Failed to start control httpd");
         return NULL;
     }
 
-    httpd_uri_t stream_uri   = { .uri="/",          .method=HTTP_GET,    .handler=stream_handler };
     httpd_uri_t frame_uri    = { .uri="/frame.jpg", .method=HTTP_GET,    .handler=frame_handler };
     httpd_uri_t sos_uri      = { .uri="/sos",       .method=HTTP_GET,    .handler=sos_handler };
     httpd_uri_t sensors_uri  = { .uri="/sensors",   .method=HTTP_GET,    .handler=sensors_handler };
     httpd_uri_t vibrate_uri  = { .uri="/vibrate",   .method=HTTP_POST,   .handler=vibrate_handler };
     httpd_uri_t vibrate_opts = { .uri="/vibrate",   .method=HTTP_OPTIONS,.handler=options_handler };
-    httpd_register_uri_handler(server, &stream_uri);
     httpd_register_uri_handler(server, &frame_uri);
     httpd_register_uri_handler(server, &sos_uri);
     httpd_register_uri_handler(server, &sensors_uri);
     httpd_register_uri_handler(server, &vibrate_uri);
     httpd_register_uri_handler(server, &vibrate_opts);
-    ESP_LOGI(TAG, "HTTP server up");
+    ESP_LOGI(TAG, "Control HTTP server up on :80");
     return server;
+}
+
+static httpd_handle_t start_stream_server(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port      = 81;
+    config.ctrl_port        = 32769;        // must differ from control server
+    config.stack_size       = 8192;
+    config.max_uri_handlers = 2;
+    // Stream pool only ever needs one or two sockets — but give it room
+    // so a tab refresh doesn't immediately strangle the new connection.
+    config.lru_purge_enable  = true;
+    config.max_open_sockets  = 4;
+    // Long timeouts: the stream send loop legitimately blocks for tens of
+    // ms while the camera produces the next JPEG; we don't want LWIP
+    // declaring it dead.
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+    config.keep_alive_enable = false;
+
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start stream httpd");
+        return NULL;
+    }
+    httpd_uri_t stream_uri = { .uri="/", .method=HTTP_GET, .handler=stream_handler };
+    httpd_register_uri_handler(server, &stream_uri);
+    ESP_LOGI(TAG, "Stream HTTP server up on :81");
+    return server;
+}
+
+// Compatibility wrapper — keeps app_main's original call site working.
+static httpd_handle_t start_webserver(void) {
+    s_ctrl_server   = start_control_server();
+    s_stream_server = start_stream_server();
+    return (s_ctrl_server && s_stream_server) ? s_ctrl_server : NULL;
 }
 
 /* ---------------- SOS button: hold + multi-click detector ---------------- */
@@ -561,7 +609,7 @@ void app_main(void) {
 
     ESP_LOGI(TAG,
         "IntelliCane ready.\n"
-        "  Stream:   http://192.168.4.1/\n"
+        "  Stream:   http://192.168.4.1:81/\n"
         "  Snapshot: http://192.168.4.1/frame.jpg\n"
         "  Sensors:  http://192.168.4.1/sensors\n"
         "  SOS poll: http://192.168.4.1/sos\n"
