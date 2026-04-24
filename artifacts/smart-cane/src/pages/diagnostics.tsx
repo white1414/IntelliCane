@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSmartCane } from "@/hooks/use-smart-cane";
 import { isModelLoaded, getActiveBackend } from "@/lib/yolo";
 import { speakUrgent, ttsAvailable, stopSpeaking } from "@/lib/tts";
@@ -11,6 +11,40 @@ import { getGuardianPhone } from "@/lib/settings";
 import { useToast } from "@/hooks/use-toast";
 import { ShieldAlert, Volume2, VolumeX, Phone, Hand, Flashlight } from "lucide-react";
 import { ESP32Client, type SosEvent } from "@/lib/esp32";
+
+// Snapshot preview that polls /frame.jpg directly. We don't reuse the
+// home-page poller because that one lives inside the page; the
+// diagnostics card needs its own self-contained refresher. Same fix
+// as on home: crossOrigin="anonymous" so the WebView treats it as
+// CORS-clean (the firmware sends ACAO:* on /frame.jpg).
+function DiagnosticsSnapshot({ client, state }: { client: ESP32Client | null; state: string }) {
+  const imgRef = useRef<HTMLImageElement>(null);
+  useEffect(() => {
+    if (!client) return;
+    const tick = () => { if (imgRef.current) imgRef.current.src = client.snapshotUrl; };
+    tick();
+    const id = window.setInterval(tick, 250);
+    return () => window.clearInterval(id);
+  }, [client]);
+  return (
+    <div className="space-y-2">
+      <span className="text-sm block">Camera snapshot (live, ~4 fps)</span>
+      <div className="w-full aspect-video bg-black rounded-lg overflow-hidden flex items-center justify-center border border-border">
+        {client ? (
+          <img
+            ref={imgRef}
+            crossOrigin="anonymous"
+            className="w-full h-full object-contain"
+            alt="Camera test snapshot"
+            data-testid="img-test-stream"
+          />
+        ) : (
+          <span className="text-muted-foreground text-xs font-mono">No client ({state})</span>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // Diagnostics is also where the SOS hold-button and the audio mute
 // toggle now live (they used to be in the global header). The Active
@@ -198,11 +232,54 @@ export default function DiagnosticsPage() {
             <Phone className="w-4 h-4 mr-2" /> Speed-dial 2
           </Button>
           <Button onClick={() => simulateSos("led")} variant="secondary" className="col-span-2" data-testid="button-sim-led">
-            <Flashlight className="w-4 h-4 mr-2" /> 4-tap LED toggle
+            <Flashlight className="w-4 h-4 mr-2" /> 4-tap LED toggle (simulated)
           </Button>
         </div>
         <p className="text-[11px] text-muted-foreground">
           Goes through the real handler — speech, fall-cancel, SMS, calls all behave exactly the same.
+        </p>
+      </div>
+
+      {/* ---- Real hardware LED test --------------------------------------
+          Calls GET /led?on=1|0 directly on the ESP32 so you can verify
+          the white flash LED on GPIO 4 actually turns on, separately
+          from the 4-click button path. */}
+      <div className="bg-card rounded-xl border border-border p-4 space-y-3">
+        <h3 className="font-semibold text-lg border-b border-border pb-2">Cane flashlight (hardware)</h3>
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            onClick={async () => {
+              if (!client) return;
+              const ok = await client.setLed(true);
+              toast({
+                title: ok ? "Flashlight on" : "Flashlight command failed",
+                description: ok ? "ESP32 GPIO 4 driven HIGH." : "Could not reach the cane.",
+                variant: ok ? "default" : "destructive",
+              });
+            }}
+            className="bg-primary text-primary-foreground"
+            data-testid="button-led-on"
+          >
+            <Flashlight className="w-4 h-4 mr-2" /> Light ON
+          </Button>
+          <Button
+            onClick={async () => {
+              if (!client) return;
+              const ok = await client.setLed(false);
+              toast({
+                title: ok ? "Flashlight off" : "Flashlight command failed",
+                description: ok ? "ESP32 GPIO 4 driven LOW." : "Could not reach the cane.",
+                variant: ok ? "default" : "destructive",
+              });
+            }}
+            variant="secondary"
+            data-testid="button-led-off"
+          >
+            <Flashlight className="w-4 h-4 mr-2" /> Light OFF
+          </Button>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Sends GET /led?on=1 / on=0 directly. Bypasses the 4-click handler.
         </p>
       </div>
 
@@ -295,34 +372,10 @@ export default function DiagnosticsPage() {
           <span className="font-mono text-xs">{client?.hostname ?? "—"}</span>
         </div>
 
-        <div className="space-y-2">
-          <span className="text-sm block">
-            MJPEG stream
-            {client && (client as ESP32Client).isStreamFallback && (
-              <span className="text-yellow-500 text-xs ml-2">(snapshot mode)</span>
-            )}
-          </span>
-          <div className="w-full aspect-video bg-black rounded-lg overflow-hidden flex items-center justify-center border border-border">
-            {state === "connected" && client ? (
-              <img
-                src={client.streamUrl}
-                className="w-full h-full object-contain"
-                alt="Camera test stream"
-                onError={() => {
-                  (client as ESP32Client).reportStreamError();
-                  // Retry with fresh URL after backoff
-                  const img = document.querySelector('[alt="Camera test stream"]') as HTMLImageElement | null;
-                  if (img && client) {
-                    setTimeout(() => { img.src = client.streamUrl; }, 1500);
-                  }
-                }}
-              />
-            ) : (
-              <span className="text-muted-foreground text-xs font-mono">No stream</span>
-            )}
-          </div>
-        </div>
+        <DiagnosticsSnapshot client={client} state={state} />
       </div>
+
+      {/* End of HW connection card (snapshot inserted above). */}
 
       <div className="bg-card rounded-xl border border-border p-4 space-y-3">
         <h3 className="font-semibold text-lg border-b border-border pb-2">Latest SOS</h3>

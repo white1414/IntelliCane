@@ -24,8 +24,17 @@ export default function Home() {
   // mount. If this stays at 0 while `state==="connected"` you know the
   // /sensors poll is fine but the stream socket on :81 is dead.
   const [frameCount, setFrameCount] = useState(0);
-  
+  // Live-feed strategy: poll /frame.jpg as JPEG snapshots at ~7 fps. The
+  // multipart MJPEG <img> stream worked in desktop Chrome but was wildly
+  // unreliable in the Capacitor Android WebView (some WebView builds
+  // never fire onLoad per-frame, so detection saw naturalWidth=0 and
+  // skipped every tick → 0 fps forever). Snapshot polling is ~5 KB/frame
+  // over local WiFi, which is nothing, and the WebView fires onLoad
+  // every time so the YOLO loop gets a fresh frame each tick.
+  const SNAPSHOT_INTERVAL_MS = 140;
+
   const imgRef = useRef<HTMLImageElement>(null);
+  const snapshotTimerRef = useRef<number | null>(null);
   const scratchCanvasRef = useRef<HTMLCanvasElement>(null);
   const drawCanvasRef = useRef<HTMLCanvasElement>(null);
   const loopRef = useRef<number | null>(null);
@@ -37,6 +46,28 @@ export default function Home() {
     const id = window.setInterval(() => setHealthTick(t => t + 1), 1000);
     return () => window.clearInterval(id);
   }, []);
+
+  // Snapshot poller — keeps a fresh JPEG flowing into <img> regardless
+  // of what state we're in. The image element will sit blank until the
+  // first frame arrives, then update every SNAPSHOT_INTERVAL_MS. We
+  // never tear this down on a transient connection blip; we just keep
+  // poking the ESP32 and the next successful response unblanks the
+  // image.
+  useEffect(() => {
+    if (!client) return;
+    const tick = () => {
+      const img = imgRef.current;
+      if (img) img.src = (client as ESP32Client).snapshotUrl;
+    };
+    tick(); // fire one immediately so we don't wait 140 ms for first frame
+    snapshotTimerRef.current = window.setInterval(tick, SNAPSHOT_INTERVAL_MS);
+    return () => {
+      if (snapshotTimerRef.current) {
+        window.clearInterval(snapshotTimerRef.current);
+        snapshotTimerRef.current = null;
+      }
+    };
+  }, [client]);
 
   // Pre-load model
   useEffect(() => {
@@ -188,30 +219,22 @@ export default function Home() {
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               ref={imgRef}
-              src={client.streamUrl}
+              // crossOrigin="anonymous" is REQUIRED so the YOLO detect()
+              // step can drawImage() this <img> onto the scratch canvas
+              // without tainting it. Without this attribute every
+              // detection tick throws SecurityError silently and the
+              // overlay never gets bounding boxes drawn → 0 fps.
+              // The ESP32 firmware sends Access-Control-Allow-Origin: *
+              // on /frame.jpg so this is safe.
+              crossOrigin="anonymous"
               className={`absolute inset-0 w-full h-full object-contain transition-opacity ${state === "connected" ? "opacity-100" : "opacity-50"}`}
               alt="Live feed from smart cane"
               onLoad={() => {
-                // For multipart MJPEG <img>, onLoad fires once per
-                // decoded frame in modern Chromium/WebView. We count
-                // frames so the UI can prove the stream socket is
-                // genuinely delivering — not just connected.
                 (client as ESP32Client).markFrameReceived();
                 setFrameCount(c => c + 1);
               }}
               onError={() => {
-                // Report the stream error to the client so it can
-                // track consecutive failures and switch to /frame.jpg
-                // fallback if :81 is unreachable.
                 (client as ESP32Client).reportStreamError();
-                // Force the <img> to retry by pushing a fresh URL —
-                // the client.streamUrl getter returns a different URL
-                // depending on whether we're in fallback mode.
-                window.setTimeout(() => {
-                  if (imgRef.current && client) {
-                    imgRef.current.src = client.streamUrl;
-                  }
-                }, 1500);
               }}
             />
             <canvas

@@ -94,6 +94,15 @@ export class ESP32Client {
     this.host = host.replace(/^https?:\/\//, "").replace(/\/$/, "");
   }
 
+  // Always-fresh JPEG snapshot URL on :80. This is what the home page
+  // polls every ~140 ms because (a) the multipart MJPEG <img> never
+  // worked reliably in the Capacitor Android WebView and (b) snapshots
+  // come with Access-Control-Allow-Origin:* so the YOLO canvas stays
+  // CORS-clean and detect() can read pixels without throwing.
+  get snapshotUrl(): string {
+    return `http://${this.host}/frame.jpg?t=${Date.now()}`;
+  }
+
   get streamUrl(): string {
     if (this.streamFallback) {
       // Fallback: use /frame.jpg on port 80 with a cache-buster.
