@@ -67,7 +67,14 @@ function getTflite(): typeof TFLiteNS {
 }
 
 const INPUT_SIZE = 640;
-const NUM_CLASSES = CLASS_NAMES.length;
+// We DO NOT hard-code NUM_CLASSES from CLASS_NAMES.length any more.
+// The .tflite model's actual class count is derived from its output
+// tensor shape at runtime (see detect()). Hard-coding caused silent
+// "Unexpected model output shape" failures whenever labels.ts and the
+// trained model went out of sync — e.g. model trained on 80 COCO
+// classes but labels.ts edited down to a custom 74-class list. Now we
+// trust the model and just look up names from CLASS_NAMES with a
+// "class_<id>" fallback for any IDs beyond the labels list.
 
 export interface Detection {
   classId: number;
@@ -279,19 +286,25 @@ export async function detect(
     for (let i = 1; i < outputs.length; i++) (outputs as TFCoreNS.Tensor[])[i].dispose();
   }
 
-  const expectedAttrs = 4 + NUM_CLASSES;
-  let numAnchors: number;
-  let attrIsFastAxis: boolean; // true → [1, A, 4+nc]; false → [1, 4+nc, A]
-  if (dims[1] === expectedAttrs) {
-    numAnchors = dims[2]!;
-    attrIsFastAxis = false;
-  } else if (dims[2] === expectedAttrs) {
-    numAnchors = dims[1]!;
-    attrIsFastAxis = true;
-  } else {
-    throw new Error(
-      `Unexpected model output shape [${dims.join(",")}]; expected one dim to equal ${expectedAttrs}`,
-    );
+  // Output is YOLOv8-style: one dim is 4+nc (small), the other is the
+  // number of anchors (large, typically 8400 for 640x640 input). We
+  // pick the smaller of the two non-batch dims as the attribute axis,
+  // derive nc from it, and wire up indexing accordingly. This way the
+  // .tflite is fully self-describing — labels.ts can have any length
+  // (including 0) without breaking inference.
+  if (dims.length !== 3 || dims[0] !== 1) {
+    throw new Error(`Unexpected model output rank: shape [${dims.join(",")}]`);
+  }
+  const dA = dims[1]!;
+  const dB = dims[2]!;
+  const attrAxis = dA < dB ? 1 : 2;
+  const expectedAttrs = attrAxis === 1 ? dA : dB;
+  const numAnchors    = attrAxis === 1 ? dB : dA;
+  const numClasses    = expectedAttrs - 4;
+  // attrIsFastAxis is true iff attrs are the LAST dim ([1, A, 4+nc]).
+  const attrIsFastAxis = attrAxis === 2;
+  if (numClasses <= 0 || numAnchors <= 0) {
+    throw new Error(`Bad model output shape [${dims.join(",")}]`);
   }
 
   const get = (anchor: number, attr: number): number =>
@@ -314,7 +327,7 @@ export async function detect(
   for (let i = 0; i < numAnchors; i++) {
     let bestClass = -1;
     let bestScore = 0;
-    for (let c = 0; c < NUM_CLASSES; c++) {
+    for (let c = 0; c < numClasses; c++) {
       const score = get(i, 4 + c);
       if (score > bestScore) {
         bestScore = score;
