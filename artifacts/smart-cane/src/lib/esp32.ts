@@ -88,7 +88,7 @@ export class ESP32Client {
   // exhaustion, etc.), we fall back to polling /frame.jpg on :80.
   private streamFallback = false;
   private streamErrorCount = 0;
-  private static readonly STREAM_ERROR_THRESHOLD = 3;
+  private static readonly STREAM_ERROR_THRESHOLD = 8;
 
   constructor(host: string) {
     this.host = host.replace(/^https?:\/\//, "").replace(/\/$/, "");
@@ -188,7 +188,7 @@ export class ESP32Client {
   async setVibrate(on: boolean): Promise<boolean> {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 2000);
+      const tid = window.setTimeout(() => ctrl.abort(), 6000);
       const resp = await fetch(`http://${this.host}/vibrate?on=${on ? 1 : 0}`, {
         method: "POST",
         cache: "no-store",
@@ -211,7 +211,7 @@ export class ESP32Client {
   async setLed(on: boolean): Promise<boolean> {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 2000);
+      const tid = window.setTimeout(() => ctrl.abort(), 6000);
       const resp = await fetch(`http://${this.host}/led?on=${on ? 1 : 0}`, {
         cache: "no-store",
         signal: ctrl.signal,
@@ -284,7 +284,7 @@ export class ESP32Client {
   private async pollHealth() {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 2000);
+      const tid = window.setTimeout(() => ctrl.abort(), 6000);
       const resp = await fetch(`http://${this.host}/health`, {
         cache: "no-store",
         signal: ctrl.signal,
@@ -312,7 +312,7 @@ export class ESP32Client {
   private async pollSensors() {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 2000);
+      const tid = window.setTimeout(() => ctrl.abort(), 6000);
       const resp = await fetch(`http://${this.host}/sensors`, {
         cache: "no-store",
         signal: ctrl.signal,
@@ -356,7 +356,7 @@ export class ESP32Client {
   private async pollSos() {
     try {
       const ctrl = new AbortController();
-      const tid = window.setTimeout(() => ctrl.abort(), 2000);
+      const tid = window.setTimeout(() => ctrl.abort(), 6000);
       const resp = await fetch(`http://${this.host}/sos`, {
         cache: "no-store",
         signal: ctrl.signal,

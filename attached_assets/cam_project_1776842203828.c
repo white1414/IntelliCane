@@ -258,7 +258,9 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
         if (r1 != ESP_OK || r2 != ESP_OK) {
             consecutive_failures++;
-            ESP_LOGW(TAG, "Stream send chunk failed (%d/3), backing off", consecutive_failures);
+            // Demoted to debug — Capacitor WebView routinely tears down
+            // the stream socket every few seconds during normal use.
+            ESP_LOGD(TAG, "Stream send chunk failed (%d/3)", consecutive_failures);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -266,7 +268,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         vTaskDelay(pdMS_TO_TICKS(100));  // ~10 fps
     }
 
-    ESP_LOGI(TAG, "Stream handler exiting (client likely disconnected)");
+    ESP_LOGD(TAG, "Stream handler exiting (client disconnected)");
     return ESP_OK;
 }
 
@@ -412,7 +414,7 @@ static esp_err_t health_handler(httpd_req_t *req) {
     char resp[192];
     int len = snprintf(resp, sizeof(resp),
         "{\"ok\":true,\"uptime_ms\":%lld,\"free_heap\":%u,"
-        "\"stream_port\":81,\"version\":\"v2.2\"}",
+        "\"stream_port\":81,\"version\":\"v2.3\"}",
         (long long)(esp_timer_get_time() / 1000LL),
         (unsigned)esp_get_free_heap_size());
     return httpd_resp_send(req, resp, len);
@@ -518,8 +520,12 @@ static httpd_handle_t start_control_server(void) {
     //   NEW config: control=3 + stream=2 = 5 → 3 free sockets as buffer.
     //   This gives enough headroom for transient connections without
     //   evicting the long-lived stream socket.
+    // v2.3 socket budget: control=4 + stream=3 = 7 active sockets max,
+    // leaves 3 free for SoftAP DHCP/DNS + the inevitable WebView preflight.
+    // The previous 3+2 was too tight: a single Capacitor preflight could
+    // bump the live MJPEG socket out via lru_purge, blackening the feed.
     config.lru_purge_enable  = true;
-    config.max_open_sockets  = 3;
+    config.max_open_sockets  = 4;
     config.recv_wait_timeout = 5;
     config.send_wait_timeout = 5;
     config.keep_alive_enable = false;
@@ -579,7 +585,7 @@ static httpd_handle_t start_stream_server(void) {
     // the control server + SoftAP's DHCP/DNS sockets.
     // (See socket budget note in start_control_server.)
     config.lru_purge_enable  = true;
-    config.max_open_sockets  = 2;
+    config.max_open_sockets  = 3;
     // Long timeouts: the stream send loop legitimately blocks for tens of
     // ms while the camera produces the next JPEG; we don't want LWIP
     // declaring it dead.
@@ -778,6 +784,17 @@ void app_main(void) {
         nvs_flash_erase();
         nvs_flash_init();
     }
+
+    // Silence httpd's WARN-level "error in send : 104" and "uri handler
+    // execution failed" log spam. Those happen every time the phone's
+    // fetch AbortController fires (Chromium WebView's default behaviour),
+    // which tears down the socket while the ESP32 is mid-send. The send
+    // failure is harmless — the next poll just opens a fresh socket — but
+    // the messages flood the serial monitor and hide real errors. Keep
+    // ERROR-level logs from these tags so genuine failures still surface.
+    esp_log_level_set("httpd_uri",  ESP_LOG_ERROR);
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_parse", ESP_LOG_ERROR);
 
     i2c_init();
 
