@@ -47,25 +47,72 @@ export default function Home() {
     return () => window.clearInterval(id);
   }, []);
 
-  // Snapshot poller — keeps a fresh JPEG flowing into <img> regardless
-  // of what state we're in. The image element will sit blank until the
-  // first frame arrives, then update every SNAPSHOT_INTERVAL_MS. We
-  // never tear this down on a transient connection blip; we just keep
-  // poking the ESP32 and the next successful response unblanks the
-  // image.
+  // Snapshot poller — keeps a fresh JPEG flowing into <img>.
+  //
+  // CRITICAL: we *chain* the next request off the previous one's load /
+  // error event. The naïve setInterval(140 ms) approach we tried first
+  // is what caused the ESP-IDF log spam:
+  //
+  //   W httpd_txrx: httpd_sock_err: error in send : 104
+  //   W httpd_uri:  httpd_uri: uri handler execution failed
+  //
+  // A JPEG over the ESP32's SoftAP takes ~200–500 ms to deliver. With
+  // a fixed 140 ms timer we kept reassigning img.src while the previous
+  // fetch was still in flight — the WebView immediately cancelled the
+  // old TCP connection, the ESP32's send() returned ECONNRESET, the
+  // /frame.jpg handler was reported as "execution failed", AND no
+  // frame ever finished loading → img.naturalWidth stayed 0 → the YOLO
+  // loop skipped every tick → "no object detection".
+  //
+  // Chaining via onLoad/onError guarantees AT MOST ONE in-flight
+  // request per <img> at any time, which makes the ESP32 happy and
+  // gives the model real frames to chew on.
   useEffect(() => {
     if (!client) return;
-    const tick = () => {
+    let cancelled = false;
+    let backoffMs = 0;
+
+    const requestNext = () => {
+      if (cancelled) return;
       const img = imgRef.current;
-      if (img) img.src = (client as ESP32Client).snapshotUrl;
+      if (!img) {
+        // <img> not mounted yet — try again shortly.
+        snapshotTimerRef.current = window.setTimeout(requestNext, 100);
+        return;
+      }
+      img.src = (client as ESP32Client).snapshotUrl;
     };
-    tick(); // fire one immediately so we don't wait 140 ms for first frame
-    snapshotTimerRef.current = window.setInterval(tick, SNAPSHOT_INTERVAL_MS);
+
+    // Bound to the <img>'s onLoad in JSX below: scheduleNextFrame() is
+    // exposed via the ref through the onLoad handler in the snapshot-
+    // chained handlers below. We can't attach listeners here cleanly
+    // because React owns the element; instead we expose the chain via
+    // window-scoped refs that the JSX onLoad/onError invoke.
+    (window as unknown as { __icSnapNext?: () => void }).__icSnapNext = () => {
+      if (cancelled) return;
+      // Pace the next request slightly so we don't pin the WiFi at
+      // 100% utilisation; ~7 fps is plenty for YOLO's needs.
+      backoffMs = 0;
+      snapshotTimerRef.current = window.setTimeout(requestNext, 80);
+    };
+    (window as unknown as { __icSnapErr?: () => void }).__icSnapErr = () => {
+      if (cancelled) return;
+      // Exponential backoff up to 2 s on errors so we don't DoS the cane
+      // while it's struggling.
+      backoffMs = Math.min(2000, backoffMs === 0 ? 250 : backoffMs * 2);
+      snapshotTimerRef.current = window.setTimeout(requestNext, backoffMs);
+    };
+
+    requestNext();
+
     return () => {
+      cancelled = true;
       if (snapshotTimerRef.current) {
-        window.clearInterval(snapshotTimerRef.current);
+        window.clearTimeout(snapshotTimerRef.current);
         snapshotTimerRef.current = null;
       }
+      delete (window as unknown as { __icSnapNext?: () => void }).__icSnapNext;
+      delete (window as unknown as { __icSnapErr?:  () => void }).__icSnapErr;
     };
   }, [client]);
 
@@ -232,9 +279,14 @@ export default function Home() {
               onLoad={() => {
                 (client as ESP32Client).markFrameReceived();
                 setFrameCount(c => c + 1);
+                // Chain the next snapshot request so we never have two
+                // /frame.jpg fetches in flight at once. See the long
+                // comment on the snapshot poller useEffect above.
+                (window as unknown as { __icSnapNext?: () => void }).__icSnapNext?.();
               }}
               onError={() => {
                 (client as ESP32Client).reportStreamError();
+                (window as unknown as { __icSnapErr?: () => void }).__icSnapErr?.();
               }}
             />
             <canvas
