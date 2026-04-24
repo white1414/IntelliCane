@@ -14,6 +14,19 @@ export default function Home() {
   const [isRunning, setIsRunning] = useState(false);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelReady, setModelReady] = useState(false);
+  // Surfaced to the user as a banner. Without this, a model load
+  // failure (e.g. Capacitor 404 on /yolo.tflite, or all tf-core
+  // backends failing init) just leaves the START DETECTION button
+  // greyed out forever with no on-screen explanation.
+  const [modelError, setModelError] = useState<string | null>(null);
+  // Most recent error from the per-frame detect() call. We log every
+  // failure to console.warn but on Android there's no console — so we
+  // also surface the latest one in the perf overlay.
+  const [detectError, setDetectError] = useState<string | null>(null);
+  // Number of detection ticks we've actually run since pressing Start.
+  // If this stays at 0 while isRunning=true, the loop's image-ready
+  // guard is failing — which means the <img> isn't decoding frames.
+  const [tickCount, setTickCount] = useState(0);
   const [fps, setFps] = useState(0);
   const [infTime, setInfTime] = useState(0);
   // We rerender the "last contact" pill once per second so the seconds
@@ -120,12 +133,19 @@ export default function Home() {
   useEffect(() => {
     if (!isModelLoaded()) {
       setModelLoading(true);
+      setModelError(null);
       const url = import.meta.env.BASE_URL.replace(/\/$/, "") + "/yolo.tflite";
       loadModel(url).then(() => {
         setModelReady(true);
         setModelLoading(false);
       }).catch(e => {
         console.error("Failed to load model", e);
+        // Surface a short message in the UI so the user knows WHY the
+        // START DETECTION button is greyed out. Common causes:
+        //   - 404 on /yolo.tflite (asset not bundled in APK)
+        //   - 404 on /tflite-wasm/tflite_web_api_client.js
+        //   - All tf-core backends failed init (very rare)
+        setModelError(String(e?.message ?? e));
         setModelLoading(false);
       });
     } else {
@@ -138,7 +158,12 @@ export default function Home() {
   };
 
   useEffect(() => {
-    if (isRunning && modelReady && state === "connected") {
+    // IMPORTANT: detection no longer waits for state === "connected".
+    // The connection state is driven by the /sensors poll on :80 — but
+    // detection only needs the <img> to be decoding /frame.jpg snapshots,
+    // which is independent. If the Nano UART stalls but the camera is
+    // fine, we'd previously freeze detection with no on-screen explanation.
+    if (isRunning && modelReady) {
       const targetFps = getTargetFps();
       const intervalMs = 1000 / targetFps;
       const confThresh = getConfThreshold();
@@ -161,6 +186,8 @@ export default function Home() {
               const end = performance.now();
               setInfTime(Math.round(end - start));
               setFps(Math.round(1000 / (end - start)));
+              setTickCount(c => c + 1);
+              setDetectError(null);
 
               drawDetections(detections);
 
@@ -168,7 +195,9 @@ export default function Home() {
                 announceDetection(detections[0].className);
               }
             } catch (e) {
+              const msg = String((e as Error)?.message ?? e);
               console.warn("[YOLO] Detection tick failed:", e);
+              setDetectError(msg.slice(0, 120));
             }
           }
           detecting = false;
@@ -191,7 +220,7 @@ export default function Home() {
     setFps(0);
     setInfTime(0);
     return undefined;
-  }, [isRunning, modelReady, state, audioMuted]);
+  }, [isRunning, modelReady, audioMuted]);
 
   // Sync draw canvas size with img
   useEffect(() => {
@@ -329,12 +358,31 @@ export default function Home() {
 
             {/* Perf overlay — top-left, only while detecting. */}
             {isRunning && (
-              <div className="absolute top-2 left-2 bg-black/60 backdrop-blur text-white text-xs px-2 py-1 rounded-md font-mono flex flex-col">
-                <span>{infTime}ms</span>
-                <span>{fps} FPS</span>
-                <span className="text-[10px] opacity-60">{getActiveBackend()}</span>
+              <div className="absolute top-2 left-2 bg-black/60 backdrop-blur text-white text-xs px-2 py-1 rounded-md font-mono flex flex-col max-w-[60%]">
+                <span>{infTime}ms · {fps} FPS</span>
+                <span className="text-[10px] opacity-60">{getActiveBackend()} · {tickCount}t</span>
+                {detectError && (
+                  <span className="text-[10px] text-red-300 break-words">{detectError}</span>
+                )}
               </div>
             )}
+
+            {/* Model-status pill — bottom-left of viewport. Rendered AFTER
+                the status overlay so it stacks on top and remains visible
+                even during a connection blip. */}
+            <div className="absolute bottom-2 left-2 z-10 bg-black/70 backdrop-blur text-white text-[10px] px-2 py-1 rounded-md font-mono flex items-center gap-2 pointer-events-none max-w-[80%]">
+              <span className={`inline-block w-2 h-2 rounded-full ${
+                modelError ? "bg-red-400" :
+                modelReady ? "bg-green-400" :
+                "bg-yellow-400 animate-pulse"
+              }`} />
+              <span>
+                AI: {modelError ? "error" : modelReady ? `ready (${getActiveBackend()})` : "loading"}
+              </span>
+              {modelError && (
+                <span className="opacity-80 truncate">{modelError}</span>
+              )}
+            </div>
 
             {/* Status overlay shown only when we're not "connected". */}
             {state !== "connected" && (
@@ -372,7 +420,7 @@ export default function Home() {
           size="lg"
           className={`w-full h-24 text-2xl font-bold rounded-2xl flex flex-col gap-2 ${isRunning ? "bg-destructive hover:bg-destructive/90 text-destructive-foreground" : "bg-primary hover:bg-primary/90 text-primary-foreground"}`}
           onClick={toggleRunning}
-          disabled={state !== "connected" || !modelReady}
+          disabled={!modelReady}
           aria-live="polite"
         >
           {isRunning ? (
